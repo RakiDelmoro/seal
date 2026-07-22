@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pt
+*.npy
+*.csv
+results/
+.hypothesis/
+.pi/
+.pytest_cache/
+*.egg-info/
