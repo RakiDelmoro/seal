@@ -88,6 +88,10 @@ class EventConv2d(nn.Module):
             return out
 
         delta = x - self.x_prev
+        # Per-element thresholds observe the delta to update their running
+        # scale (EWMA of |delta|) BEFORE we gate with theta. Homeostat.observe
+        # is a no-op (it uses the scalar event rate via the agent's update call).
+        self.threshold.observe(delta, getattr(self, 'last_mask', None))
         mask = _straight_through_mask(delta, self.threshold.theta)
         d = delta * mask
         # bias * 0: bias was applied once at the first frame; do not re-apply.
@@ -172,6 +176,7 @@ class EventLinear(nn.Module):
         if not bool(self._initialized[0]):
             return self._init_first(x)
         delta = x - self.x_prev
+        self.threshold.observe(delta, getattr(self, 'last_mask', None))
         mask = _straight_through_mask(delta, self.threshold.theta)
         d = delta * mask
         out = self.out_prev + F.linear(d, self.weight,

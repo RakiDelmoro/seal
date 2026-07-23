@@ -36,7 +36,7 @@ def _run(cfg, n_steps):
             agent.reset_episode(); obs, _ = env.reset(); a, pending = agent.act(obs)
         else:
             a2, np_ = agent.act(next_obs)
-            td = agent.learn(pending, float(r), v_next=np_.v.detach(), done=False)
+            td = agent.learn(pending, float(r), v_next=agent.bootstrap(np_, False), done=False)
             tds.append(td); flops_ev.append(agent.event_flops())
             pending = np_; a = a2
     env.close()

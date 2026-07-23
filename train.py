@@ -25,7 +25,8 @@ from model.metrics import CSVLogger, feature_rank
 
 def run(cfg, seed: int = 0, debug: bool = False):
     torch.manual_seed(seed); np.random.seed(seed)
-    env, spec = make_env(cfg.env_id, seed=seed)
+    env, spec = make_env(cfg.env_id, seed=seed, scale_reward=cfg.scale_reward,
+                         ema_alphas=cfg.ema_alphas, ema_lags=cfg.ema_lags)
     agent = StreamingActorCritic(cfg, n_actions=spec.n_actions, device="cpu")
     # Warm up normalizer + homeostat before any learning (so theta settles on a
     # stable normalization and the Welford stats converge before weight updates).
@@ -36,12 +37,13 @@ def run(cfg, seed: int = 0, debug: bool = False):
     tag = cfg.run_name
     cols = ["step", "episode", "return", "td_err", "event_flops", "dense_flops",
             "event_rate_mean", "frac_weights_updated", "dormant_frac",
-            "feat_rank", "alpha_eff", "epsilon"]
+            "feat_rank", "alpha_eff", "theta_mean"]
     logger = CSVLogger(os.path.join(cfg.out_dir, f"{tag}.csv"), cols)
 
     obs, _ = env.reset(seed=seed)
     a, pending = agent.act(obs)
     ep_return = 0.0
+    raw_ep_return = 0.0
     ep_idx = 0
     start = time.time()
     last_log = 0
@@ -50,6 +52,7 @@ def run(cfg, seed: int = 0, debug: bool = False):
         next_obs, r, term, trunc, info = env.step(a)
         done = bool(term or trunc)
         ep_return += float(r)
+        raw_ep_return += float(info.get("raw_reward", r))
 
         if done:
             # terminal: v_next = 0, no forward wasted on the terminal frame
@@ -57,27 +60,40 @@ def run(cfg, seed: int = 0, debug: bool = False):
             ep_idx += 1
             if debug and ep_idx % 10 == 0:
                 fps = t / max(1e-6, time.time() - start)
-                print(f"ep {ep_idx} step {t} return {ep_return:.1f} "
+                print(f"ep {ep_idx} step {t} pong={raw_ep_return:.0f} "
                       f"td {td_err:.3f} flops {agent.event_flops()} "
                       f"fps {fps:.0f}")
-            _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg)
+            _maybe_log(logger, t, ep_idx, raw_ep_return, td_err, agent, cfg)
             agent.reset_episode()
             obs, _ = env.reset()
             a, pending = agent.act(obs)
             ep_return = 0.0
+            raw_ep_return = 0.0
         else:
             # forward next_obs -> next action AND bootstrap value v_next
             a_next, next_pending = agent.act(next_obs)
             td_err = agent.learn(pending, float(r),
-                                 v_next=next_pending.v.detach(), done=False)
+                                 v_next=agent.bootstrap(next_pending, done=False),
+                                 done=False)
             pending = next_pending
             a = a_next
             if t - last_log >= cfg.log_every:
-                _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg, running=True)
+                _maybe_log(logger, t, ep_idx, raw_ep_return, td_err, agent, cfg, running=True)
                 last_log = t
 
     env.close()
     return os.path.join(cfg.out_dir, f"{tag}.csv")
+
+
+def _theta_mean(threshold) -> float:
+    """Mean theta across elements (scalar diagnostic for both threshold kinds).
+
+    PerPixelThreshold.theta is a tensor [C,H,W]/[D]; HomeostaticThreshold.theta
+    is a float. Return a scalar mean for logging."""
+    th = threshold.theta
+    if isinstance(th, torch.Tensor):
+        return round(float(th.mean().item()), 6)
+    return round(float(th), 6)
 
 
 def _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg, running=False):
@@ -101,7 +117,7 @@ def _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg, running=False):
         "dormant_frac": round(dormant, 4),
         "feat_rank": feature_rank(h_np),
         "alpha_eff": round(a_eff, 8),
-        "epsilon": round(agent.encoder.event_layers[0].threshold.theta, 6),
+        "theta_mean": _theta_mean(agent.encoder.event_layers[0].threshold),
     })
 
 

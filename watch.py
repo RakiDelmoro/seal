@@ -45,8 +45,8 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         gym.register_envs(ale_py)
         env = gym.make(cfg.env_id, render_mode="rgb_array")
         from env.envs_atari import NoopResetEnv, FireResetEnv, EpisodicLifeEnv
-        from env.norm_wrappers import NormalizeObservation
-        from env.envs import EMAWrapper
+        from env.norm_wrappers import NormalizeObservation, ScaleReward
+        from env.envs import EMAWrapper, MultiScaleEMAWrapper
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = gym.wrappers.MaxAndSkipObservation(env, skip=4)
@@ -55,13 +55,19 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
         env = NormalizeObservation(env, clip=5.0)
-        env = EMAWrapper(env, alpha=cfg.ema_alpha)
+        if cfg.scale_reward:
+            env = ScaleReward(env, gamma=cfg.gamma)
+        if cfg.ema_alphas is not None and len(cfg.ema_alphas) > 0:
+            env = MultiScaleEMAWrapper(env, alphas=cfg.ema_alphas, lags=cfg.ema_lags)
+        else:
+            env = EMAWrapper(env, alpha=cfg.ema_alpha)
         spec_obs, _ = env.reset(seed=seed)
         from env.envs import EnvSpec
         from config import PRESETS
         spec = EnvSpec(PRESETS[cfg.env_id], np.moveaxis(np.asarray(spec_obs),-1,0).shape, env.action_space.n)
     else:
-        env, spec = make_env(cfg.env_id, seed=seed)
+        env, spec = make_env(cfg.env_id, seed=seed, scale_reward=cfg.scale_reward,
+                             ema_alphas=cfg.ema_alphas, ema_lags=cfg.ema_lags)
 
     agent = StreamingActorCritic(cfg, spec.n_actions)
     agent.encoder.record_acts = True   # per-layer activation magnitude for diagnostics
@@ -153,6 +159,7 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         obs, _ = env.reset()
         a, pending = agent.act(obs)
         ep_ret = 0.0
+        raw_ep_ret = 0.0
         print(f"[ckpt] resumed from {path}: step={ck['step']} episodes={ck['n_episodes']} "
               f"best_ret20={best_ret20:.2f} corrVr={corrVr:.3f}", flush=True)
         return int(ck["step"]), int(ck["n_episodes"]), best_ret20
@@ -171,11 +178,13 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         font_sm = pygame.font.SysFont("monospace", 13)
 
     # ---- live stats ----
-    ep_returns = []          # all completed episode returns
+    ep_returns = []          # all completed episode returns (scaled)
+    raw_ep_returns = []      # raw Pong scores (sum of info[raw_reward])
     v_at_ep = []             # V at the moment each episode ended
     recent_ret = collections.deque(maxlen=20)
     recent_v = collections.deque(maxlen=20)
     ep_ret = 0.0
+    raw_ep_ret = 0.0
     corrVr = 0.0
     log_rows = []            # for the periodic CSV
     csv_path = os.path.join(cfg.out_dir, f"{cfg.run_name}.csv")
@@ -202,6 +211,7 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         obs, _ = env.reset()
         a, pending = agent.act(obs)
         ep_ret = 0.0
+        raw_ep_ret = 0.0
 
     try:
         while t < frames:
@@ -214,10 +224,13 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
             next_obs, r, term, trunc, info = env.step(a)
             done = bool(term or trunc)
             ep_ret += float(r)
+            raw_ep_ret += float(info.get("raw_reward", r))
 
             if done:
                 agent.learn(pending, float(r), v_next=0.0, done=True)
                 ep_returns.append(ep_ret)
+                raw_ep_returns.append(raw_ep_ret)
+                raw_run_ret = float(np.mean(raw_ep_returns[-20:])) if raw_ep_returns else 0.0
                 v_at_ep.append(agent.last_v)
                 recent_ret.append(ep_ret); recent_v.append(agent.last_v)
                 if len(ep_returns) >= 5 and len(v_at_ep) == len(ep_returns):
@@ -242,7 +255,7 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
                     flag = "  corrVr flat (V not tracking -> not learning; stop if persists)"
                 else:
                     flag = ""
-                print(f"[EP {len(ep_returns):4d}] f={t:6d} ret={ep_ret:+6.2f} ret20={run_ret:+6.2f} "
+                print(f"[EP {len(ep_returns):4d}] f={t:6d} pong={raw_ep_ret:+3.0f} ret20={raw_run_ret:+5.1f} "
                       f"corrVr={corrVr:+.3f} |d|={abs(agent.last_td_err):.3f} V={agent.last_v:+.2f} "
                       f"ent={agent.last_entropy:.3f} act={float(np.median(acts)):.2f} "
                       f"|h|={h_mean:.2f} z={getattr(agent.opt,'last_z_sum',0):.0f} "
@@ -252,9 +265,10 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
                 obs, _ = env.reset()
                 a, pending = agent.act(obs)
                 ep_ret = 0.0
+                raw_ep_ret = 0.0
             else:
                 a2, np_ = agent.act(next_obs)
-                agent.learn(pending, float(r), v_next=np_.v.detach(), done=False)
+                agent.learn(pending, float(r), v_next=agent.bootstrap(np_, False), done=False)
                 pending = np_; a = a2
 
             t += 1

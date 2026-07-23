@@ -29,7 +29,7 @@ from torch.distributions import Categorical
 
 from config import Config
 from model.event_layers import EventConv2d, EventLinear
-from model.thresholds import HomeostaticThreshold
+from model.thresholds import HomeostaticThreshold, PerPixelThreshold
 from model.optimizers import ObGD
 from model.utility import UtilityTracker, regenerate_dead_units
 from model.metrics import extract_aux_targets, flops_event_layers, dense_flops_conv
@@ -51,27 +51,35 @@ class EventEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.event_layers = nn.ModuleList()
-        in_ch = cfg.conv_layers[0][0]  # 4 (frame stack)
+        # Derive input channels from the EMA config (N EMAs × L lags, or 1)
+        if cfg.ema_alphas is not None and len(cfg.ema_alphas) > 0:
+            in_ch = len(cfg.ema_alphas) * cfg.ema_lags
+        else:
+            in_ch = 1
         H = W = 84
         prev_ch = in_ch
-        for (ic, oc, k, st) in cfg.conv_layers:
-            th = HomeostaticThreshold(
+        # patch the first conv layer's in_ch to match (in case cfg default is stale)
+        conv_layers = list(cfg.conv_layers)
+        conv_layers[0] = (in_ch,) + tuple(conv_layers[0][1:])
+        self._conv_cfg = tuple(conv_layers)
+        def _mk_threshold():
+            if cfg.threshold_kind == "perpixel":
+                return PerPixelThreshold(k=cfg.perpixel_k,
+                                         warmup_steps=cfg.perpixel_warmup,
+                                         floor=cfg.perpixel_floor)
+            return HomeostaticThreshold(
                 target_lo=cfg.threshold_target_lo,
                 target_hi=cfg.threshold_target_hi,
                 adapt_rate=cfg.threshold_adapt_rate,
-                theta0=cfg.threshold_theta0,
-            )
+                theta0=cfg.threshold_theta0)
+        for (ic, oc, k, st) in self._conv_cfg:
+            th = _mk_threshold()
             self.event_layers.append(EventConv2d(ic, oc, k, st, th))
             prev_ch = oc
             H = (H - k) // st + 1
             W = (W - k) // st + 1
         self.flat_dim = prev_ch * H * W
-        self.th_lin = HomeostaticThreshold(
-            target_lo=cfg.threshold_target_lo,
-            target_hi=cfg.threshold_target_hi,
-            adapt_rate=cfg.threshold_adapt_rate,
-            theta0=cfg.threshold_theta0,
-        )
+        self.th_lin = _mk_threshold()
         self.fc = EventLinear(self.flat_dim, cfg.trunk_dim, self.th_lin)
         self.event_layers.append(self.fc)
         self._flat_dim = self.flat_dim
@@ -114,7 +122,7 @@ class EventEncoder(nn.Module):
     def dense_flops(self):
         H = W = 84
         total = 0
-        for (ic, oc, k, st) in self.cfg.conv_layers:
+        for (ic, oc, k, st) in self._conv_cfg:
             total += dense_flops_conv(ic, oc, k, st, H, W)
             H = (H - k) // st + 1
             W = (W - k) // st + 1
@@ -148,6 +156,7 @@ class Transition:
     action: int
     aux_targets: torch.Tensor
     feats: torch.Tensor
+    is_exploration: bool = False   # epsilon-greedy random action (skip policy grad)
 
 
 class StreamingActorCritic(nn.Module):
@@ -168,12 +177,21 @@ class StreamingActorCritic(nn.Module):
 
         self.params = [p for p in self.parameters() if p.requires_grad]
         self.opt = ObGD(self.params, alpha=cfg.alpha, kappa=cfg.kappa,
-                        lam=cfg.lam, gamma=cfg.gamma)
+                        lam=cfg.lam, gamma=cfg.gamma,
+                        max_z_sum=cfg.max_z_sum)
         self.utility = UtilityTracker(self.params, decay=cfg.utility_decay,
                                       tau_low=cfg.utility_tau_low,
                                       n_trunk_units=cfg.trunk_dim)
         self.since_active = np.zeros(cfg.trunk_dim, dtype=np.int64)
         self.global_step = 0
+        self.epsilon = float(cfg.epsilon_start)
+
+    def _update_epsilon(self):
+        """Linear decay from epsilon_start to epsilon_end over exploration_fraction."""
+        cfg = self.cfg
+        duration = max(1, int(cfg.exploration_fraction * cfg.total_frames))
+        slope = (cfg.epsilon_end - cfg.epsilon_start) / duration
+        self.epsilon = max(slope * self.global_step + cfg.epsilon_start, cfg.epsilon_end)
 
     # ------------------------------------------------------------------ state
     def reset_episode(self):
@@ -197,7 +215,10 @@ class StreamingActorCritic(nn.Module):
     def _to_obs(self, obs):
         if not isinstance(obs, torch.Tensor):
             obs = torch.from_numpy(np.asarray(obs, dtype=np.float32))
-        if obs.dim() == 3 and obs.shape[-1] in (1, 3, 4):
+        # HWC -> CHW: gym image obs are (H, W, C) with H==W==84 and C < 84.
+        # CHW (C, 84, 84) has C < 84 in dim 0, not dim 2, so is left alone.
+        if obs.dim() == 3 and obs.shape[0] == obs.shape[1] \
+                and obs.shape[-1] <= obs.shape[0] and obs.shape[-1] != obs.shape[0]:
             obs = obs.permute(2, 0, 1)  # HWC -> CHW
         if obs.dim() == 2:
             obs = obs.unsqueeze(0).unsqueeze(0)
@@ -207,13 +228,26 @@ class StreamingActorCritic(nn.Module):
 
     # ----------------------------------------------------------- forward/act
     def act(self, obs) -> tuple:
-        """Forward one observation; sample an action; return (action, Transition)."""
+        """Forward one observation; select an action; return (action, Transition).
+
+        Q mode: argmax Q(s,a) with ε-greedy override (off-policy; the greedy
+        action is what we LEARN, the random action is what we EXECUTE during
+        exploration). Trace reset on random actions (learn()).
+        AC mode: softmax-sample from policy logits with ε-greedy override.
+        """
         x = self._to_obs(obs)
         feats = self.encoder(x)
-        # No GRU — heads read directly from encoder features.
         v, logits, aux = self.heads(feats)
-        dist = Categorical(logits=logits)
-        a = int(dist.sample().item())
+        cfg = self.cfg
+        is_expl = False
+        if np.random.rand() < self.epsilon:
+            a = int(np.random.randint(0, self.n_actions))
+            is_expl = True
+        elif cfg.rl_algorithm == "q":
+            a = int(logits.detach().argmax().item())
+        else:
+            dist = Categorical(logits=logits)
+            a = int(dist.sample().item())
         aux_targets = extract_aux_targets(self.encoder.first_conv_mask(), x.shape)
         with torch.no_grad():
             f_np = feats.detach().squeeze(0).cpu().numpy()
@@ -223,35 +257,63 @@ class StreamingActorCritic(nn.Module):
             self.since_active[~active] += 1
         tr = Transition(v=v.squeeze().detach() if v.dim() else v,
                         logits=logits, aux=aux, action=a,
-                        aux_targets=aux_targets.detach(), feats=feats.detach())
+                        aux_targets=aux_targets.detach(), feats=feats.detach(),
+                        is_exploration=is_expl)
         tr.v = v if v.dim() == 0 else v.squeeze()
         return a, tr
+
+    def bootstrap(self, next_tr: Transition, done: bool) -> float:
+        """Bootstrap value for the TD target. Q mode: max_a' Q(s',a'). AC: V(s')."""
+        if done:
+            return 0.0
+        if self.cfg.rl_algorithm == "q":
+            return float(next_tr.logits.detach()[0].max().item())
+        return float(next_tr.v.detach().item())
 
     # --------------------------------------------------------------- learn
     def learn(self, pending: Transition, r: float, v_next, done: bool,
               reset_on_done: bool = True):
-        """TD(λ) update for the transition `pending` with bootstrap v_next."""
-        cfg = self.cfg
-        v = pending.v
-        v_next_t = torch.as_tensor(v_next, dtype=torch.float, device=v.device) \
-            if not isinstance(v_next, torch.Tensor) else v_next.detach()
-        td_err = float(r + cfg.gamma * float(v_next_t) * (0.0 if done else 1.0) - float(v.detach()))
+        """TD(λ) update for the transition `pending` with bootstrap v_next.
 
-        # ---- loss (paper-exact, matches official stream_ac code) ----
-        # Do NOT multiply value/policy/entropy by td_err here. ObGD multiplies
-        # by delta INTERNALLY. Putting delta in the loss double-counts it.
-        # Entropy term: sign(delta) in loss -> ObGD×delta gives |delta|·ascent.
-        dist = Categorical(logits=pending.logits)
-        logp_a = dist.log_prob(torch.tensor(pending.action, device=pending.logits.device))
-        entropy = dist.entropy().mean()
-        sign_delta = 1.0 if td_err > 0 else (-1.0 if td_err < 0 else 1e-3)
+        Q mode (Stream Q, off-policy): δ = r + γ·max_a'Q(s',a') - Q(s,a).
+            loss = -Q(s,a) + aux  (ObGD multiplies by δ; no policy grad, no entropy).
+            Traces reset on exploration actions (off-policy correction).
+        AC mode (Stream AC, on-policy): δ = r + γ·V(s') - V(s).
+            loss = -V - logp_a - sign(δ)·τ·H + aux. On exploration, skip policy grad.
+        """
+        cfg = self.cfg
+        q_mode = (cfg.rl_algorithm == "q")
+        v_next_t = torch.as_tensor(v_next, dtype=torch.float, device=pending.logits.device) \
+            if not isinstance(v_next, torch.Tensor) else v_next.detach()
+        if q_mode:
+            q_sa = pending.logits[0, pending.action]
+            td_err = float(r + cfg.gamma * float(v_next_t) * (0.0 if done else 1.0)
+                           - float(q_sa.detach()))
+        else:
+            v = pending.v
+            td_err = float(r + cfg.gamma * float(v_next_t) * (0.0 if done else 1.0)
+                           - float(v.detach()))
+
         aux_loss_t = F.mse_loss(pending.aux, pending.aux_targets.to(pending.aux.device))
-        loss = (-v - logp_a - cfg.entropy_coeff * sign_delta * entropy
-                + cfg.aux_weight * aux_loss_t)
+        if q_mode:
+            # Stream Q: only the taken action's Q-value gets the TD gradient.
+            # No policy gradient, no entropy (ε-greedy handles exploration).
+            loss = (-q_sa + cfg.aux_weight * aux_loss_t)
+            entropy = torch.tensor(0.0)
+        else:
+            dist = Categorical(logits=pending.logits)
+            logp_a = dist.log_prob(torch.tensor(pending.action, device=pending.logits.device))
+            entropy = dist.entropy().mean()
+            sign_delta = 1.0 if td_err > 0 else (-1.0 if td_err < 0 else 1e-3)
+            if pending.is_exploration:
+                loss = (-v + cfg.aux_weight * aux_loss_t)
+            else:
+                loss = (-v - logp_a - cfg.entropy_coeff * sign_delta * entropy
+                        + cfg.aux_weight * aux_loss_t)
 
         self.last_td_err = td_err
         self.last_entropy = float(entropy.detach().item())
-        self.last_v = float(v.detach().item())
+        self.last_v = float(q_sa.detach().item()) if q_mode else float(v.detach().item())
 
         # ---- backward (one-step; no BPTT, no recurrent graph) ----
         grads = torch.autograd.grad(loss, self.params, allow_unused=True,
@@ -261,15 +323,20 @@ class StreamingActorCritic(nn.Module):
 
         # ---- utility gate + ObGD step ----
         gates = self.utility.update_param_utility(td_err, self.opt.traces)
-        self.opt.step(td_err, grads, reset_traces=bool(done and reset_on_done),
+        # Reset traces on exploration actions (off-policy correction, matching
+        # paper stream_q `reset=(done or is_nongreedy)`): the random action's
+        # gradient should not accumulate credit for past policy choices.
+        reset = bool(done and reset_on_done) or pending.is_exploration
+        self.opt.step(td_err, grads, reset_traces=reset,
                       update_mask=gates)
 
         # ---- homeostasis ----
         for layer in self.encoder.event_layers:
             layer.threshold.update(layer.last_event_rate)
 
-        # ---- plasticity: regenerate dead units ----
+        # ---- epsilon decay + plasticity: regenerate dead units ----
         self.global_step += 1
+        self._update_epsilon()
         if self.global_step % cfg.regen_every == 0:
             self._regenerate()
 
