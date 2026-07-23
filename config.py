@@ -58,7 +58,7 @@ class Config:
     # ---- environment ----
     env_id: str = "ALE/Pong-v5"
     seed: int = 0
-    frame_stack: int = 4          # stack last 4 frames as input (velocity in input)
+    ema_alpha: float = 0.3        # EMA temporal accumulation (replaces frame stacking)
 
     # ---- RL ----
     gamma: float = 0.99
@@ -85,9 +85,9 @@ class Config:
     dormant_silence_steps: int = 10_000
 
     # ---- network ----
-    # EventConv2d(in, out, k, stride). First layer takes 4 stacked frames.
+    # EventConv2d(in, out, k, stride). First layer takes 1 EMA channel.
     conv_layers: tuple = (
-        (4, 16, 8, 5),           # in_ch=4 (frame stack)
+        (1, 16, 8, 5),           # in_ch=1 (EMA)
         (16, 32, 4, 3),
         (32, 32, 3, 2),
     )

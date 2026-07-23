@@ -53,7 +53,8 @@ class ObGD:
     optionally gated by the utility mask (spec §2.7/§2.8).
     """
     def __init__(self, params, alpha: float = 1.0, kappa: float = 2.0,
-                 lam: float = 0.8, gamma: float = 0.99):
+                 lam: float = 0.8, gamma: float = 0.99,
+                 max_z_sum: float = 10_000.0):
         self.params = list(params)
         self.alpha = float(alpha)
         self.kappa = float(kappa)
@@ -63,6 +64,11 @@ class ObGD:
         self.traces = [torch.zeros_like(p.detach()) for p in self.params]
         self.last_z_sum = 0.0
         self.last_step_size = 0.0
+        # Trace clipping: cap ‖z‖_1 so the step size can't vanish. Without this,
+        # traces accumulate unboundedly (λγ=0.792 per step → ~5x per episode,
+        # growing across episodes) until z_sum hits millions and a_eff → 0,
+        # killing all learning. Standard in the eligibility trace literature.
+        self.max_z_sum = float(max_z_sum)
 
     def _accumulate_traces(self, grads):
         with torch.no_grad():
@@ -83,11 +89,17 @@ class ObGD:
                      this step (utility gate). Traces still accumulate.
         """
         self._accumulate_traces(grads)          # full grads, all params
-        delta = float(td_error)
+        # ---- trace clipping: cap ‖z‖_1 to prevent step size vanishing ----
         with torch.no_grad():
             z_sum = 0.0
             for t in self.traces:
                 z_sum += float(t.abs().sum().item())
+            if z_sum > self.max_z_sum:
+                scale = self.max_z_sum / z_sum
+                for t in self.traces:
+                    t.mul_(scale)
+                z_sum = self.max_z_sum
+        delta = float(td_error)
         delta_bar = max(abs(delta), 1.0)
         dot_product = delta_bar * z_sum * self.alpha * self.kappa
         step_size = self.alpha / dot_product if dot_product > 1.0 else self.alpha

@@ -46,7 +46,7 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         env = gym.make(cfg.env_id, render_mode="rgb_array")
         from env.envs_atari import NoopResetEnv, FireResetEnv, EpisodicLifeEnv
         from env.norm_wrappers import NormalizeObservation
-        from env.envs import FrameStackWrapper
+        from env.envs import EMAWrapper
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = gym.wrappers.MaxAndSkipObservation(env, skip=4)
@@ -55,7 +55,7 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
         env = NormalizeObservation(env, clip=5.0)
-        env = FrameStackWrapper(env, stack_size=cfg.frame_stack)
+        env = EMAWrapper(env, alpha=cfg.ema_alpha)
         spec_obs, _ = env.reset(seed=seed)
         from env.envs import EnvSpec
         from config import PRESETS
