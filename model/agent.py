@@ -1,23 +1,23 @@
-"""StreamingActorCritic — SEAL architecture (event-driven + frame stacking).
+"""SEAL agent — Stream Q with event-driven encoder.
 
 Architecture:
-  4 stacked frames [1,4,84,84] (velocity is in the input, no RNN)
-    -> EventConv2d(4->16, 8, s5) -> LeakyReLU + LayerNorm
+  1 EMA channel [1,1,84,84]  (single EMA, alpha=0.2, ~4-frame trail)
+    -> EventConv2d(1->16, 8, s5)  -> LeakyReLU + LayerNorm
     -> EventConv2d(16->32, 4, s3) -> LeakyReLU + LayerNorm
     -> EventConv2d(32->32, 3, s2) -> LeakyReLU + LayerNorm
     -> flatten -> EventLinear(256) -> LeakyReLU + LayerNorm
     -> heads:
-       value:  Linear(256, 1)
-       policy: Linear(256, 6)    # softmax, adaptive entropy
-       aux:    Linear(256, 3)    # (ball_x, ball_y, paddle_contact)
+       Q:     Linear(256, 6)   # Q-values per action (argmax = greedy action)
+       aux:   Linear(256, 3)   # (ball_x, ball_y, paddle_contact)
 
-No GRU. No BPTT. No hidden state. Pure feedforward with frame stacking.
-The event deltas are 4 channels of frame-to-frame motion — velocity is baked
-into the event mechanism itself.
+Stream Q (off-policy): δ = r + γ·max_a'Q(s',a') - Q(s,a). Bootstraps from the
+greedy next Q regardless of the action taken, so the agent learns greedy
+Q-values even during epsilon-greedy exploration. Traces reset on exploration
+actions (off-policy correction). No policy gradient, no entropy — exploration
+is handled by epsilon-greedy.
 
-Paper-faithful recipe: ObGD + eligibility traces (λ=0.8) + LayerNorm + sparse
-init 90% + adaptive entropy (sign(δ)·τ·∇H). See optimizers.py for the ObGD
-α-cancels derivation and agent.py learn() for the paper-exact loss.
+ObGD + eligibility traces (λ=0.8) + LayerNorm + 90% sparse init + per-element
+thresholds + utility gate + dead-unit regeneration.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -25,13 +25,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
 from config import Config
 from model.event_layers import EventConv2d, EventLinear
-from model.thresholds import HomeostaticThreshold, PerPixelThreshold
+from model.thresholds import PerPixelThreshold
 from model.optimizers import ObGD
-from model.utility import UtilityTracker, regenerate_dead_units
+from model.utility import UtilityTracker
 from model.metrics import extract_aux_targets, flops_event_layers, dense_flops_conv
 from model.sparse_init import apply_sparse_init
 
@@ -43,51 +42,37 @@ def _leaky(x):
 class EventEncoder(nn.Module):
     """Event-driven conv trunk + EventLinear -> 256-dim features.
 
-    Takes 4 stacked frames [1,4,84,84]. The event deltas are 4 channels of
-    frame-to-frame motion — each channel captures a different timestep's
-    change, so velocity is directly in the event input. No GRU needed.
+    Takes 1 EMA channel [1,1,84,84]. The event deltas are frame-to-frame
+    changes of the EMA trail — velocity is directly in the event input.
     """
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.event_layers = nn.ModuleList()
-        # Derive input channels from the EMA config (N EMAs × L lags, or 1)
-        if cfg.ema_alphas is not None and len(cfg.ema_alphas) > 0:
-            in_ch = len(cfg.ema_alphas) * cfg.ema_lags
-        else:
-            in_ch = 1
+        in_ch = cfg.conv_layers[0][0]   # 1 (single EMA)
         H = W = 84
         prev_ch = in_ch
-        # patch the first conv layer's in_ch to match (in case cfg default is stale)
-        conv_layers = list(cfg.conv_layers)
-        conv_layers[0] = (in_ch,) + tuple(conv_layers[0][1:])
-        self._conv_cfg = tuple(conv_layers)
-        def _mk_threshold():
-            if cfg.threshold_kind == "perpixel":
-                return PerPixelThreshold(k=cfg.perpixel_k,
-                                         warmup_steps=cfg.perpixel_warmup,
-                                         floor=cfg.perpixel_floor)
-            return HomeostaticThreshold(
-                target_lo=cfg.threshold_target_lo,
-                target_hi=cfg.threshold_target_hi,
-                adapt_rate=cfg.threshold_adapt_rate,
-                theta0=cfg.threshold_theta0)
-        for (ic, oc, k, st) in self._conv_cfg:
-            th = _mk_threshold()
+        for (ic, oc, k, st) in cfg.conv_layers:
+            th = PerPixelThreshold(k=cfg.perpixel_k,
+                                   warmup_steps=cfg.perpixel_warmup,
+                                   floor=cfg.perpixel_floor)
             self.event_layers.append(EventConv2d(ic, oc, k, st, th))
             prev_ch = oc
             H = (H - k) // st + 1
             W = (W - k) // st + 1
         self.flat_dim = prev_ch * H * W
-        self.th_lin = _mk_threshold()
+        self.th_lin = PerPixelThreshold(k=cfg.perpixel_k,
+                                        warmup_steps=cfg.perpixel_warmup,
+                                        floor=cfg.perpixel_floor)
         self.fc = EventLinear(self.flat_dim, cfg.trunk_dim, self.th_lin)
         self.event_layers.append(self.fc)
         self._flat_dim = self.flat_dim
+        self._conv_cfg = cfg.conv_layers
         self.record_acts = False
         self.last_acts = []
 
     def _ln(self, x):
-        """Paper §3.3 LayerNorm: no learnable scale/bias. Applied to pre-act."""
+        """LayerNorm: no learnable scale/bias. Applied to pre-act."""
         return F.layer_norm(x, x.shape[-1:] if x.dim() == 2 else x.shape[1:])
 
     def forward(self, x):
@@ -131,26 +116,23 @@ class EventEncoder(nn.Module):
 
 
 class Heads(nn.Module):
-    """Value, policy, aux heads with LayerNorm."""
+    """Q + aux heads with LayerNorm. (No separate value head — Q IS the value.)"""
     def __init__(self, cfg: Config, n_actions: int):
         super().__init__()
         self.ln = nn.LayerNorm(cfg.trunk_dim)
-        self.value = nn.Linear(cfg.trunk_dim, 1)
-        self.policy = nn.Linear(cfg.trunk_dim, n_actions)
+        self.q = nn.Linear(cfg.trunk_dim, n_actions)
         self.aux = nn.Linear(cfg.trunk_dim, cfg.aux_dim)
 
     def forward(self, h):
         z = self.ln(h)
-        v = self.value(z).squeeze(-1)
-        logits = self.policy(z)
+        logits = self.q(z)            # Q-values per action
         aux = self.aux(z)
-        return v, logits, aux
+        return logits, aux
 
 
 @dataclass
 class Transition:
     """Outputs from one forward pass, held for the next-step TD update."""
-    v: torch.Tensor
     logits: torch.Tensor
     aux: torch.Tensor
     action: int
@@ -159,12 +141,11 @@ class Transition:
     is_exploration: bool = False   # epsilon-greedy random action (skip policy grad)
 
 
-class StreamingActorCritic(nn.Module):
-    """SEAL: event-driven encoder + frame stacking + ObGD + traces.
+class SEALAgent(nn.Module):
+    """SEAL: event-driven encoder + Stream Q + ObGD + eligibility traces.
 
-    No GRU. No hidden state. Pure feedforward: 4 stacked frames -> event convs
-    -> event linear -> heads. Temporal info is in the input (frame stack), not
-    in recurrent memory.
+    No GRU. No BPTT. No hidden state. Pure feedforward: EMA -> event convs
+    -> event linear -> Q/aux heads. Temporal info is in the EMA input.
     """
     def __init__(self, cfg: Config, n_actions: int, device: str = "cpu"):
         super().__init__()
@@ -200,12 +181,10 @@ class StreamingActorCritic(nn.Module):
         self.opt.reset()
 
     def warmup_forward(self, obs):
-        """Forward one obs through encoder (advancing caches + homeostat), no
+        """Forward one obs through encoder (advancing caches + thresholds), no
         learning. Used during normalizer warmup."""
         x = self._to_obs(obs)
         _ = self.encoder(x)
-        for layer in self.encoder.event_layers:
-            layer.threshold.update(layer.last_event_rate)
 
     def reset_after_warmup(self):
         self.reset_episode()
@@ -230,24 +209,20 @@ class StreamingActorCritic(nn.Module):
     def act(self, obs) -> tuple:
         """Forward one observation; select an action; return (action, Transition).
 
-        Q mode: argmax Q(s,a) with ε-greedy override (off-policy; the greedy
-        action is what we LEARN, the random action is what we EXECUTE during
-        exploration). Trace reset on random actions (learn()).
-        AC mode: softmax-sample from policy logits with ε-greedy override.
+        Epsilon-greedy: with probability ε, take a uniform random action
+        (exploration); otherwise take argmax Q(s,a) (greedy). The greedy
+        action is what we LEARN (Q-learning), the random action is what we
+        EXECUTE during exploration. Traces reset on random actions (learn()).
         """
         x = self._to_obs(obs)
         feats = self.encoder(x)
-        v, logits, aux = self.heads(feats)
-        cfg = self.cfg
+        logits, aux = self.heads(feats)
         is_expl = False
         if np.random.rand() < self.epsilon:
             a = int(np.random.randint(0, self.n_actions))
             is_expl = True
-        elif cfg.rl_algorithm == "q":
-            a = int(logits.detach().argmax().item())
         else:
-            dist = Categorical(logits=logits)
-            a = int(dist.sample().item())
+            a = int(logits.detach().argmax().item())
         aux_targets = extract_aux_targets(self.encoder.first_conv_mask(), x.shape)
         with torch.no_grad():
             f_np = feats.detach().squeeze(0).cpu().numpy()
@@ -255,65 +230,40 @@ class StreamingActorCritic(nn.Module):
             active = (np.abs(f_np) > 1e-3)
             self.since_active[active] = 0
             self.since_active[~active] += 1
-        tr = Transition(v=v.squeeze().detach() if v.dim() else v,
-                        logits=logits, aux=aux, action=a,
+        tr = Transition(logits=logits, aux=aux, action=a,
                         aux_targets=aux_targets.detach(), feats=feats.detach(),
                         is_exploration=is_expl)
-        tr.v = v if v.dim() == 0 else v.squeeze()
         return a, tr
 
     def bootstrap(self, next_tr: Transition, done: bool) -> float:
-        """Bootstrap value for the TD target. Q mode: max_a' Q(s',a'). AC: V(s')."""
+        """Bootstrap value for the TD target: max_a' Q(s',a') (greedy next Q)."""
         if done:
             return 0.0
-        if self.cfg.rl_algorithm == "q":
-            return float(next_tr.logits.detach()[0].max().item())
-        return float(next_tr.v.detach().item())
+        return float(next_tr.logits.detach()[0].max().item())
 
     # --------------------------------------------------------------- learn
     def learn(self, pending: Transition, r: float, v_next, done: bool,
               reset_on_done: bool = True):
-        """TD(λ) update for the transition `pending` with bootstrap v_next.
+        """TD(λ) Stream Q update for `pending` with bootstrap v_next.
 
-        Q mode (Stream Q, off-policy): δ = r + γ·max_a'Q(s',a') - Q(s,a).
-            loss = -Q(s,a) + aux  (ObGD multiplies by δ; no policy grad, no entropy).
-            Traces reset on exploration actions (off-policy correction).
-        AC mode (Stream AC, on-policy): δ = r + γ·V(s') - V(s).
-            loss = -V - logp_a - sign(δ)·τ·H + aux. On exploration, skip policy grad.
+        δ = r + γ·max_a'Q(s',a')·(1-done) - Q(s,a)
+        loss = -Q(s,a) + aux_weight·MSE(aux, aux_targets)
+        (ObGD multiplies the gradient by δ internally; no delta in the loss.)
+        Traces reset on exploration actions (off-policy correction).
         """
         cfg = self.cfg
-        q_mode = (cfg.rl_algorithm == "q")
         v_next_t = torch.as_tensor(v_next, dtype=torch.float, device=pending.logits.device) \
             if not isinstance(v_next, torch.Tensor) else v_next.detach()
-        if q_mode:
-            q_sa = pending.logits[0, pending.action]
-            td_err = float(r + cfg.gamma * float(v_next_t) * (0.0 if done else 1.0)
-                           - float(q_sa.detach()))
-        else:
-            v = pending.v
-            td_err = float(r + cfg.gamma * float(v_next_t) * (0.0 if done else 1.0)
-                           - float(v.detach()))
+        q_sa = pending.logits[0, pending.action]
+        td_err = float(r + cfg.gamma * float(v_next_t) * (0.0 if done else 1.0)
+                       - float(q_sa.detach()))
 
         aux_loss_t = F.mse_loss(pending.aux, pending.aux_targets.to(pending.aux.device))
-        if q_mode:
-            # Stream Q: only the taken action's Q-value gets the TD gradient.
-            # No policy gradient, no entropy (ε-greedy handles exploration).
-            loss = (-q_sa + cfg.aux_weight * aux_loss_t)
-            entropy = torch.tensor(0.0)
-        else:
-            dist = Categorical(logits=pending.logits)
-            logp_a = dist.log_prob(torch.tensor(pending.action, device=pending.logits.device))
-            entropy = dist.entropy().mean()
-            sign_delta = 1.0 if td_err > 0 else (-1.0 if td_err < 0 else 1e-3)
-            if pending.is_exploration:
-                loss = (-v + cfg.aux_weight * aux_loss_t)
-            else:
-                loss = (-v - logp_a - cfg.entropy_coeff * sign_delta * entropy
-                        + cfg.aux_weight * aux_loss_t)
+        loss = (-q_sa + cfg.aux_weight * aux_loss_t)
 
         self.last_td_err = td_err
-        self.last_entropy = float(entropy.detach().item())
-        self.last_v = float(q_sa.detach().item()) if q_mode else float(v.detach().item())
+        self.last_entropy = 0.0          # n/a for Stream Q (epsilon-greedy explores)
+        self.last_v = float(q_sa.detach().item())
 
         # ---- backward (one-step; no BPTT, no recurrent graph) ----
         grads = torch.autograd.grad(loss, self.params, allow_unused=True,
@@ -325,14 +275,10 @@ class StreamingActorCritic(nn.Module):
         gates = self.utility.update_param_utility(td_err, self.opt.traces)
         # Reset traces on exploration actions (off-policy correction, matching
         # paper stream_q `reset=(done or is_nongreedy)`): the random action's
-        # gradient should not accumulate credit for past policy choices.
+        # gradient should not accumulate credit for past greedy choices.
         reset = bool(done and reset_on_done) or pending.is_exploration
         self.opt.step(td_err, grads, reset_traces=reset,
                       update_mask=gates)
-
-        # ---- homeostasis ----
-        for layer in self.encoder.event_layers:
-            layer.threshold.update(layer.last_event_rate)
 
         # ---- epsilon decay + plasticity: regenerate dead units ----
         self.global_step += 1
@@ -343,13 +289,13 @@ class StreamingActorCritic(nn.Module):
         return td_err
 
     def _regenerate(self):
-        """Regenerate bottom-1% dead trunk units."""
+        """Regenerate bottom-1% dead trunk units (ReDo-style)."""
         cfg = self.cfg
         dead = self.utility.dormant_units(self.since_active, cfg.dormant_silence_steps)
         if len(dead) == 0:
             return
         with torch.no_grad():
-            for lin in (self.heads.value, self.heads.policy, self.heads.aux):
+            for lin in (self.heads.q, self.heads.aux):
                 lin.weight[:, dead] = 0.0
             # reinit incoming weights to dead units (EventLinear output rows)
             fc_w = self.encoder.fc.weight
@@ -366,6 +312,6 @@ class StreamingActorCritic(nn.Module):
 
     def dense_flops(self) -> int:
         d = self.encoder.dense_flops()
-        d += self.cfg.trunk_dim * 1 * 2 + self.cfg.trunk_dim * self.n_actions * 2
+        d += self.cfg.trunk_dim * self.n_actions * 2
         d += self.cfg.trunk_dim * self.cfg.aux_dim * 2
         return d

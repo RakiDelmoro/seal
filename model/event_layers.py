@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.thresholds import HomeostaticThreshold
+from model.thresholds import PerPixelThreshold
 
 
 def _straight_through_mask(delta: torch.Tensor, theta: float) -> torch.Tensor:
@@ -46,7 +46,7 @@ class EventConv2d(nn.Module):
     """Incremental conv2d over a stream of single frames [1, C, H, W]."""
 
     def __init__(self, in_ch: int, out_ch: int, k: int, stride: int,
-                 threshold: HomeostaticThreshold):
+                 threshold: PerPixelThreshold):
         super().__init__()
         self.in_ch, self.out_ch, self.k, self.stride = in_ch, out_ch, k, stride
         self.threshold = threshold
@@ -145,7 +145,7 @@ class EventLinear(nn.Module):
     """Incremental linear over a stream of single vectors [1, D] (or [D])."""
 
     def __init__(self, in_features: int, out_features: int,
-                 threshold: HomeostaticThreshold, bias: bool = True):
+                 threshold: PerPixelThreshold, bias: bool = True):
         super().__init__()
         self.in_features, self.out_features = in_features, out_features
         self.threshold = threshold

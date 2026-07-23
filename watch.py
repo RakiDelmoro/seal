@@ -31,7 +31,7 @@ import pygame
 
 from config import config_from_preset
 from env.envs import make_env, warmup
-from model.agent import StreamingActorCritic
+from model.agent import SEALAgent
 
 
 def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path="", ckpt_every_arg=50_000):
@@ -45,8 +45,8 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         gym.register_envs(ale_py)
         env = gym.make(cfg.env_id, render_mode="rgb_array")
         from env.envs_atari import NoopResetEnv, FireResetEnv, EpisodicLifeEnv
-        from env.norm_wrappers import NormalizeObservation, ScaleReward
-        from env.envs import EMAWrapper, MultiScaleEMAWrapper
+        from env.norm_wrappers import NormalizeObservation
+        from env.envs import EMAWrapper
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = gym.wrappers.MaxAndSkipObservation(env, skip=4)
@@ -55,21 +55,15 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
         env = NormalizeObservation(env, clip=5.0)
-        if cfg.scale_reward:
-            env = ScaleReward(env, gamma=cfg.gamma)
-        if cfg.ema_alphas is not None and len(cfg.ema_alphas) > 0:
-            env = MultiScaleEMAWrapper(env, alphas=cfg.ema_alphas, lags=cfg.ema_lags)
-        else:
-            env = EMAWrapper(env, alpha=cfg.ema_alpha)
+        env = EMAWrapper(env, alpha=cfg.ema_alpha)
         spec_obs, _ = env.reset(seed=seed)
         from env.envs import EnvSpec
         from config import PRESETS
         spec = EnvSpec(PRESETS[cfg.env_id], np.moveaxis(np.asarray(spec_obs),-1,0).shape, env.action_space.n)
     else:
-        env, spec = make_env(cfg.env_id, seed=seed, scale_reward=cfg.scale_reward,
-                             ema_alphas=cfg.ema_alphas, ema_lags=cfg.ema_lags)
+        env, spec = make_env(cfg.env_id, seed=seed, ema_alpha=cfg.ema_alpha)
 
-    agent = StreamingActorCritic(cfg, spec.n_actions)
+    agent = SEALAgent(cfg, spec.n_actions)
     agent.encoder.record_acts = True   # per-layer activation magnitude for diagnostics
     warmup(env, agent, n_frames=1000, seed=seed)
     agent.encoder.record_acts = True   # re-enable after warmup resets it via reset_episode path

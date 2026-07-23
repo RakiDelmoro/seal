@@ -19,15 +19,14 @@ import torch
 
 from config import config_from_preset
 from env.envs import make_env, obs_to_chw, warmup
-from model.agent import StreamingActorCritic
+from model.agent import SEALAgent
 from model.metrics import CSVLogger, feature_rank
 
 
 def run(cfg, seed: int = 0, debug: bool = False):
     torch.manual_seed(seed); np.random.seed(seed)
-    env, spec = make_env(cfg.env_id, seed=seed, scale_reward=cfg.scale_reward,
-                         ema_alphas=cfg.ema_alphas, ema_lags=cfg.ema_lags)
-    agent = StreamingActorCritic(cfg, n_actions=spec.n_actions, device="cpu")
+    env, spec = make_env(cfg.env_id, seed=seed, ema_alpha=cfg.ema_alpha)
+    agent = SEALAgent(cfg, n_actions=spec.n_actions, device="cpu")
     # Warm up normalizer + homeostat before any learning (so theta settles on a
     # stable normalization and the Welford stats converge before weight updates).
     warmup(env, agent, n_frames=1000, seed=seed)
@@ -86,10 +85,7 @@ def run(cfg, seed: int = 0, debug: bool = False):
 
 
 def _theta_mean(threshold) -> float:
-    """Mean theta across elements (scalar diagnostic for both threshold kinds).
-
-    PerPixelThreshold.theta is a tensor [C,H,W]/[D]; HomeostaticThreshold.theta
-    is a float. Return a scalar mean for logging."""
+    """Mean theta across elements (scalar diagnostic)."""
     th = threshold.theta
     if isinstance(th, torch.Tensor):
         return round(float(th.mean().item()), 6)
