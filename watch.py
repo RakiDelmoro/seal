@@ -174,7 +174,7 @@ def run(frames, seed, alpha, kappa, fps_cap, render, log_every, resume_path="", 
         game_w, game_h = 160 * scale, 210 * scale
         panel_w = 340
         screen = pygame.display.set_mode((game_w + panel_w, game_h))
-        pygame.display.set_caption(f"SEAL learning Pong  (lambda={lam}, seed={seed})")
+        pygame.display.set_caption(f"SEAL learning Pong  (seed={seed})")
         font = pygame.font.SysFont("monospace", 16)
         font_sm = pygame.font.SysFont("monospace", 13)
 
@@ -290,7 +290,7 @@ def run(frames, seed, alpha, kappa, fps_cap, render, log_every, resume_path="", 
                     run_ret = float(np.mean(recent_ret)) if recent_ret else 0.0
                     lines = [
                         (f"SEAL  (streaming + event-driven)", (220,220,220), font),
-                        (f"lambda={lam} alpha={alpha} kappa={kappa}", (160,160,180), font_sm),
+                        (f"alpha={alpha} kappa={kappa}", (160,160,180), font_sm),
                         (f"", (0,0,0), font_sm),
                         (f"frame   {t}/{frames}  ({100*t/frames:.1f}%)", (200,200,200), font),
                         (f"episode {len(ep_returns)}", (200,200,200), font),
