@@ -56,6 +56,12 @@ class Config:
     lam: float = 0.8              # eligibility trace λ (paper value)
     alpha: float = 1.0            # ObGD step magnitude (cancels in bound-active regime)
     kappa: float = 2.0            # overshooting bound (paper value)
+    # AdaptiveObGD second-moment normalization (Adam-style, paper verbatim):
+    # per-param v[p] = β2·v + (1-β2)·(δ·trace)²; trace normalized by sqrt(v_hat).
+    # This is the paper's fix for trace explosion — replaces the hard clip that
+    # froze learning at ~756k frames. z_sum stays O(n_params), no ceiling to hit.
+    beta2: float = 0.999
+    eps: float = 1e-8
 
     # ---- exploration: epsilon-greedy ----
     # Stream Q bootstraps from max_a' Q(s',a') regardless of the action taken,
@@ -79,12 +85,6 @@ class Config:
     perpixel_k: float = 2.0
     perpixel_warmup: int = 50
     perpixel_floor: float = 1e-6
-
-    # ---- streaming RL: trace bounding (Bug 5 safety net) ----
-    # Traces are already event-gated by the forward hard mask (grad_W is exactly
-    # zero at inactive input locations), so z_sum stays bounded naturally.
-    # This hard clip is a safety net that rarely engages.
-    max_z_sum: float = 10_000.0
 
     # ---- utility / plasticity ----
     utility_decay: float = 0.9999

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from config import Config
 from model.event_layers import EventConv2d, EventLinear
 from model.thresholds import PerPixelThreshold
-from model.optimizers import ObGD
+from model.optimizers import AdaptiveObGD
 from model.utility import UtilityTracker
 from model.metrics import extract_aux_targets, flops_event_layers, dense_flops_conv
 from model.sparse_init import apply_sparse_init
@@ -157,9 +157,9 @@ class SEALAgent(nn.Module):
         apply_sparse_init(self, sparsity=0.9)
 
         self.params = [p for p in self.parameters() if p.requires_grad]
-        self.opt = ObGD(self.params, alpha=cfg.alpha, kappa=cfg.kappa,
-                        lam=cfg.lam, gamma=cfg.gamma,
-                        max_z_sum=cfg.max_z_sum)
+        self.opt = AdaptiveObGD(self.params, alpha=cfg.alpha, kappa=cfg.kappa,
+                                lam=cfg.lam, gamma=cfg.gamma,
+                                beta2=cfg.beta2, eps=cfg.eps)
         self.utility = UtilityTracker(self.params, decay=cfg.utility_decay,
                                       tau_low=cfg.utility_tau_low,
                                       n_trunk_units=cfg.trunk_dim)

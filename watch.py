@@ -34,12 +34,12 @@ from env.envs import make_env, warmup
 from model.agent import SEALAgent
 
 
-def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path="", ckpt_every_arg=50_000):
+def run(frames, seed, alpha, kappa, fps_cap, render, log_every, resume_path="", ckpt_every_arg=50_000):
     torch.manual_seed(seed); np.random.seed(seed)
-    # SEAL full: event-driven encoder + aux task + utility gate (always on).
+    # SEAL: event-driven encoder + Stream Q + multi-timescale traces (always on).
     cfg = config_from_preset("ALE/Pong-v5", total_frames=frames,
-                             run_name=f"seal_l{int(lam*100)}_s{seed}",
-                             alpha=alpha, lam=lam, kappa=kappa)
+                             run_name=f"seal_s{seed}",
+                             alpha=alpha, kappa=kappa)
     if render:
         import gymnasium as gym, ale_py
         gym.register_envs(ale_py)
@@ -98,6 +98,8 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
             "n_episodes": len(ep_returns),
             "model_state": agent.state_dict(),
             "opt_traces": [tr.detach().clone() for tr in agent.opt.traces],
+            "opt_v": [vi.detach().clone() for vi in agent.opt._v],
+            "opt_counter": getattr(agent.opt, "counter", 0),
             "opt_z_sum": getattr(agent.opt, "last_z_sum", 0.0),
             "opt_step_size": getattr(agent.opt, "last_step_size", 0.0),
             "since_active": agent.since_active.copy(),
@@ -111,9 +113,8 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
             "recent_v": list(recent_v),
             "corrVr": corrVr,
             "best_ret20": best_ret20,
-            "cfg": {"lam": lam, "alpha": alpha, "kappa": kappa, "seed": seed,
-                    "env_id": cfg.env_id, "lam": lam, "alpha": alpha,
-                    "kappa": kappa, "seed": seed},
+            "cfg": {"alpha": alpha, "kappa": kappa, "seed": seed,
+                    "env_id": cfg.env_id, "lam": cfg.lam, "beta2": cfg.beta2},
         }, path)
         return path
 
@@ -122,10 +123,16 @@ def run(frames, seed, lam, alpha, kappa, fps_cap, render, log_every, resume_path
         nonlocal best_ret20, corrVr, ep_ret
         ck = torch.load(path, map_location="cpu")
         agent.load_state_dict(ck["model_state"])
-        # restore optimizer traces
+        # restore optimizer traces + second moments (AdaptiveObGD)
         for i, tr in enumerate(ck["opt_traces"]):
             if i < len(agent.opt.traces):
                 agent.opt.traces[i].copy_(tr)
+        if "opt_v" in ck:
+            for i, vi in enumerate(ck["opt_v"]):
+                if i < len(agent.opt._v):
+                    agent.opt._v[i].copy_(vi)
+        if hasattr(agent.opt, "counter"):
+            agent.opt.counter = int(ck.get("opt_counter", 0))
         if hasattr(agent.opt, "last_z_sum"):
             agent.opt.last_z_sum = ck.get("opt_z_sum", 0.0)
         if hasattr(agent.opt, "last_step_size"):
@@ -359,7 +366,6 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--frames", type=int, default=500_000)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--lam", type=float, default=0.8, help="trace decay (0.8 = paper value)")
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--kappa", type=float, default=2.0)
     p.add_argument("--fps", type=int, default=0, help="cap display fps (0 = as fast as possible)")
@@ -370,7 +376,7 @@ def main():
     p.add_argument("--ckpt-every", type=int, default=50_000,
                    help="save checkpoint every N frames (default 50000)")
     args = p.parse_args()
-    run(args.frames, args.seed, args.lam, args.alpha, args.kappa,
+    run(args.frames, args.seed, args.alpha, args.kappa,
         args.fps, not args.no_render, args.log_every, args.resume, args.ckpt_every)
 
 
