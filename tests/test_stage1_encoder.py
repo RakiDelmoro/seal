@@ -31,7 +31,7 @@ def _load_frames(n=200):
 # ---------------------------------------------------------------------------
 def test_eventconv2d_exactness():
     frames = _load_frames(50)
-    in_ch, out_ch, k, stride = 1, 8, 8, 5
+    in_ch, out_ch, k, stride = 4, 8, 8, 5
     th = PerPixelThreshold(theta0=0.0, warmup_steps=10_000)
     ev = EventConv2d(in_ch, out_ch, k, stride, th)
     ref = F.conv2d(frames, ev.weight, ev.bias, stride)
@@ -59,7 +59,7 @@ def test_eventconv_reset_cache_exactness():
     """After reset_cache, the next frame must equal its dense conv (re-seed)."""
     frames = _load_frames(30)
     th = PerPixelThreshold(theta0=0.0, warmup_steps=10_000)
-    ev = EventConv2d(1, 8, 8, 5, th)
+    ev = EventConv2d(4, 8, 8, 5, th)
     for i in range(15):
         ev(frames[i:i + 1])
     ev.reset_cache()
@@ -74,7 +74,7 @@ def test_eventconv_reset_cache_exactness():
 def test_eventconv_sparsity_settles():
     frames = _load_frames(2000)
     th = PerPixelThreshold(k=2.0, warmup_steps=50)
-    ev = EventConv2d(1, 16, 8, 5, th)
+    ev = EventConv2d(4, 16, 8, 5, th)
     rates = []
     for i in range(frames.shape[0]):
         ev(frames[i:i + 1])
@@ -94,7 +94,7 @@ def test_event_heatmap_concentrated():
     import matplotlib.pyplot as plt
     frames = _load_frames(200)
     th = PerPixelThreshold(k=2.0, warmup_steps=50)
-    ev = EventConv2d(1, 16, 8, 5, th)
+    ev = EventConv2d(4, 16, 8, 5, th)
     masks = []
     for i in range(frames.shape[0]):
         ev(frames[i:i + 1])
@@ -124,7 +124,7 @@ def test_event_heatmap_concentrated():
 def test_reconstruction_drift_bounded():
     frames = _load_frames(300)
     th = PerPixelThreshold(theta0=0.0, warmup_steps=10_000)
-    ev = EventConv2d(1, 8, 8, 5, th)
+    ev = EventConv2d(4, 8, 8, 5, th)
     max_drift = 0.0
     for i in range(frames.shape[0]):
         out = ev(frames[i:i + 1]).detach()

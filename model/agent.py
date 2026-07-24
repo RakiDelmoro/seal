@@ -49,7 +49,7 @@ class EventEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.event_layers = nn.ModuleList()
-        in_ch = cfg.conv_layers[0][0]   # 1 (single EMA)
+        in_ch = cfg.conv_layers[0][0]   # 4 (frame stack)
         H = W = 84
         prev_ch = in_ch
         for (ic, oc, k, st) in cfg.conv_layers:

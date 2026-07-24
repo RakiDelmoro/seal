@@ -2,14 +2,14 @@
 
 Single entry point: make_env(preset_id, seed) -> (env, EnvSpec).
 
-The EMA temporal wrapper replaces frame stacking: it maintains a single
-accumulated frame that captures recent motion as a smooth trail — aligned with
-the event-driven encoder's own temporal accumulation (out_prev). Simpler than
-frame stacking (1 channel vs 4), accumulates fewer eligibility traces, and
-produces cleaner event deltas.
+4-frame stacking provides temporal context (velocity is in the 4 stacked
+frames), matching the streaming-RL paper's proven Atari architecture. The
+event-driven encoder then processes frame-to-frame deltas across these
+channels.
 """
 from __future__ import annotations
 import os
+from collections import deque
 import numpy as np
 import gymnasium as gym
 
@@ -35,47 +35,48 @@ class EnvSpec:
         self.dtype = dtype
 
 
-class EMAWrapper(gym.Wrapper):
-    """Exponential moving average of frames. Replaces frame stacking.
+class FrameStackWrapper(gym.Wrapper):
+    """Stack the last N frames as separate channels. Replaces EMA.
 
-    Maintains a single accumulated frame:
-        ema_t = alpha * frame_t + (1 - alpha) * ema_{t-1}
-
-    This captures recent motion as a smooth trail (the ball appears as a
-    streak whose length encodes velocity). Aligned with the event-driven
-    encoder's own temporal accumulation (out_prev = running state updated
-    incrementally). 1 channel, ~4-frame memory at alpha=0.2.
+    Output is (H, W, N) — N copies of the grayscale frame at t, t-1, ..., t-N+1.
+    This gives the conv exact positions to difference (velocity), matching the
+    streaming-RL paper's proven Atari input. On reset, the first frame is
+    stacked N times (no zero-padding — avoids a discontinuity delta).
     """
-    def __init__(self, env: gym.Env, alpha: float = 0.2):
+    def __init__(self, env: gym.Env, num_stack: int = 4):
         super().__init__(env)
-        self.alpha = float(alpha)
-        self.ema = None
+        self.num_stack = int(num_stack)
+        self.frames = deque(maxlen=self.num_stack)
         obs_shape = env.observation_space.shape
+        # output: (H, W, N)
+        stacked_shape = obs_shape[:-1] + (self.num_stack,)
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=obs_shape, dtype=np.float32)
+            low=-np.inf, high=np.inf, shape=stacked_shape, dtype=np.float32)
 
-    def _update(self, obs):
+    def _stack(self, obs):
         obs = np.array(obs, dtype=np.float32)
-        if self.ema is None:
-            self.ema = obs.copy()
-        else:
-            self.ema = self.alpha * obs + (1.0 - self.alpha) * self.ema
-        return self.ema
+        if obs.ndim == 2:
+            obs = obs[:, :, None]
+        self.frames.append(obs)
+        # pad cold start with copies of the first frame
+        while len(self.frames) < self.num_stack:
+            self.frames.appendleft(obs.copy())
+        return np.concatenate(list(self.frames), axis=-1)  # (H, W, N)
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        return self._update(obs), reward, terminated, truncated, info
+        return self._stack(obs), reward, terminated, truncated, info
 
     def reset(self, **kwargs):
-        self.ema = None
+        self.frames.clear()
         obs, info = self.env.reset(**kwargs)
-        return self._update(obs), info
+        return self._stack(obs), info
 
 
-def _build_atari(preset: EnvPreset, seed: int, ema_alpha: float = 0.2):
+def _build_atari(preset: EnvPreset, seed: int, frame_stack: int = 4):
     """ALE Pong pipeline:
     NoopReset -> MaxAndSkip(4) -> EpisodicLife -> FireReset
-    -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5) -> EMA.
+    -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5) -> FrameStack(4).
     No reward scaling (Pong rewards are already ±1)."""
     env = gym.make(preset.id)
     env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -88,18 +89,18 @@ def _build_atari(preset: EnvPreset, seed: int, ema_alpha: float = 0.2):
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
     env = NormalizeObservation(env, clip=5.0)
-    env = EMAWrapper(env, alpha=ema_alpha)
+    env = FrameStackWrapper(env, num_stack=frame_stack)
     obs, _ = env.reset(seed=seed)
     obs_chw = np.moveaxis(np.asarray(obs), -1, 0) if obs.ndim == 3 else obs
     spec = EnvSpec(preset, obs_chw.shape, env.action_space.n)
     return env, spec
 
 
-def make_env(env_id: str, seed: int = 0, ema_alpha: float = 0.2):
+def make_env(env_id: str, seed: int = 0, frame_stack: int = 4):
     """Build the wrapped env + EnvSpec for one preset id."""
     preset = PRESETS[env_id]
     if preset.domain == "atari":
-        env, spec = _build_atari(preset, seed, ema_alpha)
+        env, spec = _build_atari(preset, seed, frame_stack=frame_stack)
     else:
         raise ValueError(f"Unknown domain for env {env_id}: {preset.domain}")
     return env, spec

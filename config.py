@@ -3,13 +3,15 @@
 Single dataclass holding ALL hyperparameters.
 
 SEAL = Streaming Event-driven Adaptive Learner. ALE Pong, 84x84 grayscale,
-single EMA temporal accumulation (1 channel, ~4-frame memory). Event-driven
-encoder + Stream Q (off-policy) + ObGD + eligibility traces + epsilon-greedy
+4-frame stacking (velocity is in the input, no RNN). Event-driven encoder +
+Stream Q (off-policy) + AdaptiveObGD + eligibility traces + epsilon-greedy
 exploration + aux task + utility gate.
+
+Matches the streaming-RL paper's proven Atari architecture (4-frame stack,
+32→64→64 convs, 256 trunk) with our event-driven encoder layered on top.
 """
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import Tuple
 
 
 @dataclass
@@ -46,10 +48,10 @@ class Config:
     # ---- environment ----
     env_id: str = "ALE/Pong-v5"
     seed: int = 0
-    # Single EMA temporal accumulation (1 channel). alpha=0.2 gives ~4 frames
-    # of effective memory ((1-alpha)/alpha = 4) — velocity is in the trail,
-    # no RNN / no frame stacking needed.
-    ema_alpha: float = 0.2
+    # 4-frame stacking (paper's proven Atari temporal input). Velocity is in
+    # the 4 stacked frames — no RNN / no EMA needed. Each frame is a separate
+    # channel, giving the conv exact positions to difference.
+    frame_stack: int = 4
 
     # ---- RL (Stream Q, off-policy) ----
     gamma: float = 0.99
@@ -58,17 +60,14 @@ class Config:
     kappa: float = 2.0            # overshooting bound (paper value)
     # AdaptiveObGD second-moment normalization (Adam-style, paper verbatim):
     # per-param v[p] = β2·v + (1-β2)·(δ·trace)²; trace normalized by sqrt(v_hat).
-    # This is the paper's fix for trace explosion — replaces the hard clip that
-    # froze learning at ~756k frames. z_sum stays O(n_params), no ceiling to hit.
+    # The paper's fix for trace explosion — z_sum stays O(n_params), no ceiling.
     beta2: float = 0.999
     eps: float = 1e-8
 
     # ---- exploration: epsilon-greedy ----
     # Stream Q bootstraps from max_a' Q(s',a') regardless of the action taken,
-    # so the agent learns greedy Q-values even during epsilon-exploration. This
-    # is critical for sparse-reward Pong: the agent accidentally scores during
-    # exploration, Q-learning propagates credit back, argmax-Q becomes a good
-    # policy. Traces reset on exploration actions (off-policy correction).
+    # so the agent learns greedy Q-values even during epsilon-exploration.
+    # Traces reset on exploration actions (off-policy correction).
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     exploration_fraction: float = 0.05   # fraction of total_frames over which ε decays
@@ -79,9 +78,7 @@ class Config:
 
     # ---- event encoder: per-element threshold (move A) ----
     # theta[e] = k * EWMA(|delta[e]|). Per-element from the first step, robust
-    # to heavy tails, self-calibrating (static elements armed at the floor,
-    # active elements fire at a stable tail rate). Structurally prevents dead
-    # layers (Bug 4). Exactness invariant holds (theta=0 => dense).
+    # to heavy tails, self-calibrating. Structurally prevents dead layers (Bug 4).
     perpixel_k: float = 2.0
     perpixel_warmup: int = 50
     perpixel_floor: float = 1e-6
@@ -93,12 +90,13 @@ class Config:
     regen_frac: float = 0.01
     dormant_silence_steps: int = 10_000
 
-    # ---- network ----
-    # EventConv2d(in, out, k, stride). First layer takes 1 EMA channel.
+    # ---- network (matches paper's Atari architecture) ----
+    # EventConv2d(in, out, k, stride). First layer takes 4 stacked frames.
+    # 32→64→64 convs (paper capacity) + 256 trunk.
     conv_layers: tuple = (
-        (1, 16, 8, 5),
-        (16, 32, 4, 3),
-        (32, 32, 3, 2),
+        (4, 32, 8, 5),
+        (32, 64, 4, 3),
+        (64, 64, 3, 2),
     )
     trunk_dim: int = 256          # EventLinear -> 256-dim features -> heads
 

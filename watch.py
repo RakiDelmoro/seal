@@ -46,7 +46,7 @@ def run(frames, seed, alpha, kappa, fps_cap, render, log_every, resume_path="", 
         env = gym.make(cfg.env_id, render_mode="rgb_array")
         from env.envs_atari import NoopResetEnv, FireResetEnv, EpisodicLifeEnv
         from env.norm_wrappers import NormalizeObservation
-        from env.envs import EMAWrapper
+        from env.envs import FrameStackWrapper
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = gym.wrappers.MaxAndSkipObservation(env, skip=4)
@@ -55,13 +55,13 @@ def run(frames, seed, alpha, kappa, fps_cap, render, log_every, resume_path="", 
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
         env = NormalizeObservation(env, clip=5.0)
-        env = EMAWrapper(env, alpha=cfg.ema_alpha)
+        env = FrameStackWrapper(env, num_stack=cfg.frame_stack)
         spec_obs, _ = env.reset(seed=seed)
         from env.envs import EnvSpec
         from config import PRESETS
         spec = EnvSpec(PRESETS[cfg.env_id], np.moveaxis(np.asarray(spec_obs),-1,0).shape, env.action_space.n)
     else:
-        env, spec = make_env(cfg.env_id, seed=seed, ema_alpha=cfg.ema_alpha)
+        env, spec = make_env(cfg.env_id, seed=seed, frame_stack=cfg.frame_stack)
 
     agent = SEALAgent(cfg, spec.n_actions)
     agent.encoder.record_acts = True   # per-layer activation magnitude for diagnostics

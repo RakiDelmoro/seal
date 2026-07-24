@@ -25,7 +25,7 @@ from model.metrics import CSVLogger, feature_rank
 
 def run(cfg, seed: int = 0, debug: bool = False):
     torch.manual_seed(seed); np.random.seed(seed)
-    env, spec = make_env(cfg.env_id, seed=seed, ema_alpha=cfg.ema_alpha)
+    env, spec = make_env(cfg.env_id, seed=seed, frame_stack=cfg.frame_stack)
     agent = SEALAgent(cfg, n_actions=spec.n_actions, device="cpu")
     # Warm up normalizer + homeostat before any learning (so theta settles on a
     # stable normalization and the Welford stats converge before weight updates).
