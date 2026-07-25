@@ -1,51 +1,12 @@
-"""SEAL metrics (spec §5) + aux-target extraction (spec §2.4).
+"""SEAL metrics (spec §5): FLOP accounting, plasticity counters, CSV logger.
 
 Analytics only -- never stores samples. Everything is computed from the
-current single sample and a few running counters.
-
-extract_aux_targets (spec §2.4, D5):
-  Aux targets come FREE from the event mask of the FIRST conv layer. The
-  centroid of event pixels approximates ball/paddle positions; the fraction
-  of event mass in the paddle's x-column approximates paddle-contact. This is
-  a deliberate design feature (spec §2.4): the aux task is supervised by the
-  event mask itself, no extra env coupling.
-
-  Calibration note (D5): with EventConv2d(8,s5) on 84x84, layer-0's mask is
-  the INPUT-space mask [1,1,84,84] (we expose last_mask in input space). The
-  centroid of lit pixels maps to a normalized (ball_x, ball_y) in [0,1].
-  Pong's own paddle is on the left (~x in [0,8]) and the opponent on the right
-  (~x in [75,83]); 'contact' = event mass in the left paddle column.
+current single sample and a few running counters. (Auxiliary prediction
+targets now live in model/gvf.py as the game-agnostic GVF bank.)
 """
 from __future__ import annotations
 import numpy as np
 import torch
-
-
-def extract_aux_targets(event_mask: torch.Tensor, obs_shape=None) -> torch.Tensor:
-    """[1,3] = (ball_x, ball_y, paddle_contact), all normalized to [0,1].
-
-    event_mask: [1, C, H, W] bool/float from EventConv2d.last_mask (input space).
-    Returns a [1,3] float tensor. If no events, returns zeros (the agent will
-    not learn from a degenerate frame; this is rare and self-corrects).
-    """
-    if event_mask.dim() == 4:
-        m = event_mask.float().sum(dim=1)  # [1, H, W] event mass per pixel
-    elif event_mask.dim() == 3:
-        m = event_mask.float()
-    else:
-        raise ValueError(f"unexpected mask shape {event_mask.shape}")
-    m = m[0]  # [H, W]
-    total = m.sum().item()
-    H, W = m.shape
-    if total <= 1e-8:
-        return torch.zeros(1, 3, device=event_mask.device)
-    ys = torch.arange(H, device=m.device, dtype=torch.float32)
-    xs = torch.arange(W, device=m.device, dtype=torch.float32)
-    cy = (m.sum(dim=1) * ys).sum() / total / max(1, H - 1)   # [0,1]
-    cx = (m.sum(dim=0) * xs).sum() / total / max(1, W - 1)   # [0,1]
-    # paddle contact: event mass fraction in left paddle column (x < ~10% W)
-    left_col = m[:, : max(1, W // 10)].sum() / total
-    return torch.stack([cx, cy, left_col]).unsqueeze(0)  # [1,3]
 
 
 def flops_event_layers(layers) -> int:

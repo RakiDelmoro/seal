@@ -18,9 +18,9 @@ SEAL is a reinforcement learning agent that learns online, one sample at a time,
 
 **Event-driven encoder:** Each conv layer caches its previous output and only processes pixels that changed above an adaptive threshold (homeostatic). Compute scales with activity, not model size. Analytic FLOP savings are reported per step.
 
-**Streaming RL:** ObGD optimizer (overshooting-bounded gradient descent), eligibility traces (λ=0.8), actor-critic with adaptive entropy bonus. One forward pass per observation, one update per step, sample discarded immediately.
+**Streaming RL:** ObGD optimizer (overshooting-bounded gradient descent) on the event encoder, eligibility traces (λ=0.8), actor-critic with adaptive entropy bonus. **SwiftTD** (Javed et al. RLC 2024) on the linear heads — True Online TD(λ) + per-feature IDBD step-size optimization + overshoot bound on the eligibility vector + step-size decay, exact where it applies (linear). One forward pass per observation, one update per step, sample discarded immediately.
 
-**Aux task:** Predicts ball position (x, y, paddle contact) from the event mask centroid of the first conv layer — free supervision from the event mechanism itself.
+**Aux task:** A game-agnostic bank of General Value Functions (GVFs) — linear TD(λ) predictions of discounted future cumulants (motion density, positive reward, negative reward, motion spread) whose cumulants come only from the event mask + reward. Replaces the old Pong-specific ball-position aux; transfers unchanged across games. Learned by SwiftTD alongside the Q head.
 
 ## Project Structure
 
@@ -34,7 +34,9 @@ seal/
     agent.py               # StreamingActorCritic (encoder + heads + step logic)
     event_layers.py        # EventConv2d, EventLinear (incremental delta-conv)
     thresholds.py          # HomeostaticThreshold (adaptive event gate)
-    optimizers.py          # ObGD (paper Algorithm 3, verbatim)
+    optimizers.py          # ObGD (paper Algorithm 3, verbatim) — encoder
+    swift_td.py            # SwiftTD (Javed et al. RLC 2024) — linear heads
+    gvf.py                 # game-agnostic GVF bank (Horde/UNREAL-style aux)
     traces.py              # eligibility trace mechanism (docs; traces in ObGD)
     utility.py             # UtilityTracker + dead-unit regeneration
     sparse_init.py         # 90% sparse initialization (paper Appendix F)
@@ -103,3 +105,4 @@ python plotting.py
 ## References
 
 - Elsayed, Vasan & Mahmood, "Streaming Deep Reinforcement Learning Finally Works", arXiv:2410.14606, 2024.
+- Javed, Sharifnassab & Sutton, "SwiftTD: A Fast and Robust Algorithm for Temporal Difference Learning", RLC 2024 (RLJ_RLC_2024_111).

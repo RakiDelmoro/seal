@@ -26,12 +26,12 @@ def _run(cfg, n_steps):
         done = bool(term or trunc)
         ep_ret += float(r)
         if done:
-            agent.learn(pending, float(r), v_next=0.0, done=True)
+            agent.learn(pending, float(r), next_pending=None, done=True)
             returns.append(ep_ret); ep_ret = 0.0
             agent.reset_episode(); obs, _ = env.reset(); a, pending = agent.act(obs)
         else:
             a2, np_ = agent.act(next_obs)
-            td = agent.learn(pending, float(r), v_next=agent.bootstrap(np_, False), done=False)
+            td = agent.learn(pending, float(r), next_pending=np_, done=False)
             tds.append(td); flops_ev.append(agent.event_flops())
             pending = np_; a = a2
     env.close()

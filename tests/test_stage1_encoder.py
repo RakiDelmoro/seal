@@ -16,7 +16,8 @@ import torch.nn.functional as F
 
 from model.event_layers import EventConv2d, EventLinear
 from model.thresholds import PerPixelThreshold
-from model.metrics import extract_aux_targets
+from model.metrics import flops_event_layers
+from model.gvf import compute_cumulants
 
 FRAMES_PATH = "results/stage1_pong_frames.npy"
 
@@ -113,9 +114,9 @@ def test_event_heatmap_concentrated():
     plt.close(fig)
     print(f"  [C] mean lit fraction: {lit_frac:.4f} (expect small/concentrated)")
     assert lit_frac < 0.20, f"events not concentrated: {lit_frac}"
-    aux = extract_aux_targets(ev.last_mask).squeeze(0).numpy()
-    assert aux.shape == (3,) and (aux >= 0).all() and (aux <= 1).all(), aux
-    print(f"  [C] aux targets (ball_x, ball_y, contact): {aux}")
+    aux = compute_cumulants(ev.last_mask, 0.0).numpy()
+    assert aux.shape == (4,) and np.isfinite(aux).all(), aux
+    print(f"  [C] gvf cumulants (motion_density, pos_reward, neg_reward, motion_spread): {aux}")
 
 
 # ---------------------------------------------------------------------------

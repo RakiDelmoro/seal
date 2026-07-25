@@ -73,12 +73,14 @@ class FrameStackWrapper(gym.Wrapper):
         return self._stack(obs), info
 
 
-def _build_atari(preset: EnvPreset, seed: int, frame_stack: int = 4):
+def _build_atari(preset: EnvPreset, seed: int, frame_stack: int = 4,
+                 render: bool = False):
     """ALE Pong pipeline:
     NoopReset -> MaxAndSkip(4) -> EpisodicLife -> FireReset
     -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5) -> FrameStack(4).
     No reward scaling (Pong rewards are already ±1)."""
-    env = gym.make(preset.id)
+    render_mode = "rgb_array" if render else None
+    env = gym.make(preset.id, render_mode=render_mode)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = NoopResetEnv(env, noop_max=30)
     env = gym.wrappers.MaxAndSkipObservation(env, skip=preset.frame_skip)
@@ -96,11 +98,17 @@ def _build_atari(preset: EnvPreset, seed: int, frame_stack: int = 4):
     return env, spec
 
 
-def make_env(env_id: str, seed: int = 0, frame_stack: int = 4):
-    """Build the wrapped env + EnvSpec for one preset id."""
+def make_env(env_id: str, seed: int = 0, frame_stack: int = 4,
+             render: bool = False):
+    """Build the wrapped env + EnvSpec for one preset id.
+
+    render=True builds the env with render_mode='rgb_array' so a GUI can
+    blit the frames via env.render().
+    """
     preset = PRESETS[env_id]
     if preset.domain == "atari":
-        env, spec = _build_atari(preset, seed, frame_stack=frame_stack)
+        env, spec = _build_atari(preset, seed, frame_stack=frame_stack,
+                                 render=render)
     else:
         raise ValueError(f"Unknown domain for env {env_id}: {preset.domain}")
     return env, spec
@@ -130,6 +138,28 @@ def warmup(env, agent, n_frames: int = 1000, seed: int = 0):
         else:
             obs = next_obs
     agent.reset_after_warmup()
+
+
+def find_norm_stats(env):
+    """Walk the wrapper stack to find the streaming NormalizeObservation stats."""
+    e = env
+    while e is not None:
+        if hasattr(e, "stats"):
+            return e.stats
+        e = getattr(e, "env", None)
+    return None
+
+
+def restore_norm_stats(env, mean, var, count):
+    """Restore Welford normalization stats into the env's normalizer."""
+    norm = find_norm_stats(env)
+    if norm is None or mean is None:
+        return
+    norm.mean = np.asarray(mean, dtype=np.float64)
+    norm.var = np.asarray(var, dtype=np.float64)
+    norm.count = int(count)
+    if norm.count > 1:
+        norm._p = norm.var * (norm.count - 1)
 
 
 class FrameRecorder:
