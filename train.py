@@ -2,7 +2,7 @@
 
 One sample per env step, used once, then discarded. No replay, no target net,
 no minibatches. Streams online: event-driven encoder + Stream Q (AdaptiveObGD)
-+ SwiftTD heads + game-agnostic GVF bank + utility gate + dead-unit regen.
++ SPR auxiliary representation + utility gate + dead-unit regen.
 
 Usage:
   # headless (fast)
@@ -71,7 +71,7 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
             "opt_counter": agent.opt.counter,
             "opt_z_sum": agent.opt.last_z_sum,
             "opt_step_size": agent.opt.last_step_size,
-            "swift_state": agent.swift.state_dict(),
+            "target_enc": agent.target_enc.state_dict(),
             "since_active": agent.since_active.copy(),
             "global_step": agent.global_step,
             "norm_mean": None if norm is None else np.array(norm.mean, dtype=np.float64),
@@ -105,8 +105,8 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
         agent.opt.counter = int(ck.get("opt_counter", 0))
         agent.opt.last_z_sum = ck.get("opt_z_sum", 0.0)
         agent.opt.last_step_size = ck.get("opt_step_size", 0.0)
-        if "swift_state" in ck:
-            agent.swift.load_state_dict(ck["swift_state"])
+        if "target_enc" in ck:
+            agent.target_enc.load_state_dict(ck["target_enc"])
         agent.since_active[:] = ck["since_active"]
         agent.global_step = int(ck["global_step"])
         restore_norm_stats(env, ck.get("norm_mean"), ck.get("norm_var"),

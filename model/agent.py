@@ -1,4 +1,4 @@
-"""SEAL agent — Stream Q with event-driven encoder.
+"""SEAL agent — Stream Q with event-driven encoder + SPR auxiliary loss.
 
 Architecture:
   4 stacked frames [1, 4, 84, 84]  (velocity is in the input, no RNN)
@@ -6,27 +6,27 @@ Architecture:
     -> EventConv2d(32->64, 4, s3) -> LeakyReLU + LayerNorm
     -> EventConv2d(64->64, 3, s2) -> LeakyReLU + LayerNorm
     -> flatten -> EventLinear(256) -> LeakyReLU + LayerNorm
-    -> heads (all pure linear via affine-free LayerNorm):
-       Q:       Linear(256, 6)   # Q-values per action (argmax = greedy action)
-       GVF bank: 4× Linear(256,1) # game-agnostic TD(λ) value predictions
-                                  # (motion_density, pos/neg_reward, motion_spread)
+    -> LayerNorm(256, affine-free) -> z
+    -> Q head: Linear(256, n_actions)   (argmax = greedy action)
 
-Stream Q (off-policy): δ = r + γ·max_a'Q(s',a') - Q(s,a). Bootstraps from the
-greedy next Q regardless of the action taken, so the agent learns greedy
-Q-values even during epsilon-greedy exploration. Traces reset on exploration
-actions (off-policy correction). No policy gradient, no entropy — exploration
-is handled by epsilon-greedy.
+Auxiliary (SPR, arXiv:2602.09396):
+  A transition model predicts z_{t+1..t+K} from z_t + actions. A momentum
+  (EMA) target encoder produces stop-gradient target latents. The SPR loss
+  (negative cosine similarity) shapes the encoder to be predictive of its own
+  future. The SPR gradient is orthogonalized against the Q gradient (so it
+  only shapes the encoder in non-conflicting directions) and norm-bounded
+  (so it can't destabilize the trunk).
 
-Two optimizers:
-  * Encoder  — AdaptiveObGD (κ-bound + Adam-style 2nd-moment normalization).
-  * Heads    — SwiftTD (True Online TD(λ) + IDBD per-feature step sizes +
-               overshoot bound + step-size decay). Exact for linear heads.
+Stream Q (off-policy): δ = r + γ·max_a'Q(s',a') - Q(s,a). ε-greedy.
+Traces reset on exploration actions (off-policy correction).
 
-Plus: eligibility traces (λ=0.8) + affine-free LayerNorm + 90% sparse init +
-per-element event thresholds + utility gate + dead-unit regeneration.
+Optimizer:
+  * Encoder + Q head — AdaptiveObGD (κ-bound + 2nd-moment normalization).
+  * SPR (transition + projection) — SGD with orthogonal projection vs Q.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -36,8 +36,8 @@ from config import Config
 from model.event_layers import EventConv2d, EventLinear
 from model.thresholds import PerPixelThreshold
 from model.optimizers import AdaptiveObGD
-from model.swift_td import SwiftTD
-from model.gvf import DEFAULT_GVFS, gvf_lams, gvf_weights, n_gvfs, compute_cumulants
+from model.target_encoder import TargetEncoder
+from model.spr import TransitionModel, ProjectionHead, spr_loss
 from model.utility import UtilityTracker
 from model.metrics import flops_event_layers, dense_flops_conv
 from model.sparse_init import apply_sparse_init
@@ -48,16 +48,13 @@ def _leaky(x):
 
 
 class EventEncoder(nn.Module):
-    """Event-driven conv trunk + EventLinear -> 256-dim features.
+    """Event-driven conv trunk + EventLinear -> 256-dim features."""
 
-    Takes 1 EMA channel [1,1,84,84]. The event deltas are frame-to-frame
-    changes of the EMA trail — velocity is directly in the event input.
-    """
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.event_layers = nn.ModuleList()
-        in_ch = cfg.conv_layers[0][0]   # 4 (frame stack)
+        in_ch = cfg.conv_layers[0][0]
         H = W = 84
         prev_ch = in_ch
         for (ic, oc, k, st) in cfg.conv_layers:
@@ -80,7 +77,6 @@ class EventEncoder(nn.Module):
         self.last_acts = []
 
     def _ln(self, x):
-        """LayerNorm: no learnable scale/bias. Applied to pre-act."""
         return F.layer_norm(x, x.shape[-1:] if x.dim() == 2 else x.shape[1:])
 
     def forward(self, x):
@@ -124,79 +120,51 @@ class EventEncoder(nn.Module):
 
 
 class Heads(nn.Module):
-    """Q head + game-agnostic GVF bank. (No separate value head — Q IS the value.)
+    """Q head only. LayerNorm is affine-free → Q is a pure linear learner."""
 
-    LayerNorm here is affine-free: it has no learnable params, so the head
-    input `z` is a deterministic function of the encoder trunk. This makes
-    every head a PURE LINEAR learner (`out = W·z + b`) — the exact setting
-    SwiftTD is derived for. The heads are updated by SwiftTD (per-feature
-    IDBD step sizes + True Online TD(λ) + overshoot bound); the encoder is
-    updated by AdaptiveObGD via gradients flowing through these
-    (frozen-per-step) heads.
-
-    The GVF bank (model/gvf.py) replaces the old Pong-specific aux head:
-    each GVF is a linear TD(λ) prediction of a discounted future cumulant
-    derived only from the event mask + reward, so it transfers across games.
-    """
-    def __init__(self, cfg: Config, n_actions: int, n_gvfs: int):
+    def __init__(self, cfg: Config, n_actions: int):
         super().__init__()
         self.ln = nn.LayerNorm(cfg.trunk_dim, elementwise_affine=False)
         self.q = nn.Linear(cfg.trunk_dim, n_actions)
-        self.gvf = nn.ModuleList([nn.Linear(cfg.trunk_dim, 1)
-                                  for _ in range(n_gvfs)])
 
     def forward(self, h):
         z = self.ln(h)
-        logits = self.q(z)                       # Q-values per action
-        gvf_preds = torch.cat([g(z) for g in self.gvf], dim=1)  # [1, n_gvfs]
-        return logits, gvf_preds, z
+        logits = self.q(z)
+        return logits, z
 
 
 @dataclass
 class Transition:
-    """Outputs from one forward pass, held for the next-step TD update."""
-    logits: torch.Tensor         # Q-values [1, n_actions]
-    gvf_preds: torch.Tensor      # GVF predictions [1, n_gvfs] (for bootstrap)
+    """Outputs from one forward pass, held for the TD update + SPR delay queue."""
+    logits: torch.Tensor
     action: int
-    feats: torch.Tensor          # encoder trunk features (256) — diagnostics / utility
-    head_features: torch.Tensor  # LayerNormed trunk (input to the linear heads) — SwiftTD φ
-    event_mask: torch.Tensor     # first-conv event mask [1,C,H,W] — GVF cumulant source
-    is_exploration: bool = False   # epsilon-greedy random action (skip policy grad)
+    feats: torch.Tensor         # trunk features [1, 256] (in-graph for SPR loss)
+    head_features: torch.Tensor # LayerNormed z [1, 256] (SPR's latent input)
+    obs: torch.Tensor           # raw input [1, 4, 84, 84] (for target encoder)
+    is_exploration: bool = False
 
 
 class SEALAgent(nn.Module):
-    """SEAL: event-driven encoder + Stream Q + ObGD + eligibility traces.
+    """SEAL: event-driven encoder + Stream Q (AdaptiveObGD) + SPR (orthogonal SGD)."""
 
-    No GRU. No BPTT. No hidden state. Pure feedforward: EMA -> event convs
-    -> event linear -> Q/GVF heads. Temporal info is in the 4-frame-stack input.
-    """
     def __init__(self, cfg: Config, n_actions: int, device: str = "cpu"):
         super().__init__()
         self.cfg = cfg
         self.n_actions = n_actions
         self.device = device
-        self.gvfs = DEFAULT_GVFS
-        self.n_gvfs = n_gvfs(self.gvfs)
         self.encoder = EventEncoder(cfg)
-        self.heads = Heads(cfg, n_actions, self.n_gvfs)
+        self.heads = Heads(cfg, n_actions)
+        self.spr_transition = TransitionModel(cfg.trunk_dim, n_actions)
+        self.spr_projection = ProjectionHead(cfg.trunk_dim, cfg.spr_proj_dim)
         apply_sparse_init(self, sparsity=0.9)
 
-        # ---- parameter split: encoder + Q head on AdaptiveObGD, GVFs on SwiftTD ----
-        # AdaptiveObGD owns the nonlinear encoder AND the Q head. The Q head
-        # bootstraps from max_a' Q(s',a') — nonlinear in the weights, the
-        # deadly-triad offender — so it needs AdaptiveObGD's κ-bound (fixed α
-        # that cancels in the bound-active regime), NOT SwiftTD's IDBD which
-        # would AMPLIFY the max-overestimation cascade by growing step sizes.
-        # SwiftTD owns only the GVF heads: pure linear PREDICTION (each
-        # bootstraps from its own next prediction, no max) — the exact setting
-        # True Online TD(λ) is valid for.
-        gvf_param_ids = set(id(p) for p in self.heads.gvf.parameters())
+        # ---- parameter split: encoder+Q on ObGD, SPR on SGD ----
+        spr_param_ids = set(id(p) for p in self.spr_transition.parameters()) | \
+                        set(id(p) for p in self.spr_projection.parameters())
         self.obgd_params = [p for p in self.parameters()
-                            if p.requires_grad and id(p) not in gvf_param_ids]
-        self.head_params = [p for p in self.parameters()
-                            if p.requires_grad and id(p) in gvf_param_ids]
-        # `self.params` = AdaptiveObGD params (autograd.grad target + utility
-        # gate). GVF heads are owned by SwiftTD and never see an autograd update.
+                            if p.requires_grad and id(p) not in spr_param_ids]
+        self.spr_params = [p for p in self.parameters()
+                           if p.requires_grad and id(p) in spr_param_ids]
         self.params = self.obgd_params
 
         self.opt = AdaptiveObGD(self.obgd_params, alpha=cfg.alpha,
@@ -205,18 +173,18 @@ class SEALAgent(nn.Module):
         self.utility = UtilityTracker(self.obgd_params, decay=cfg.utility_decay,
                                       tau_low=cfg.utility_tau_low,
                                       n_trunk_units=cfg.trunk_dim)
-        # SwiftTD on the GVF bank only (True Online TD(λ) + IDBD + bound +
-        # decay). Seeded from the sparse-initialized GVF weights.
-        self.swift = SwiftTD(self.heads.gvf, cfg, gvf_lams=gvf_lams(self.gvfs))
-        self.swift.load_from_params()
-        self.gvf_weights = gvf_weights(self.gvfs)
+
+        # ---- SPR target encoder (EMA copy, no gradients) ----
+        self.target_enc = TargetEncoder(self.encoder, tau=cfg.spr_tau)
+
+        # ---- SPR delay queue: hold K transitions to compute the loss K steps later ----
+        self.spr_queue = deque(maxlen=cfg.spr_horizon)
 
         self.since_active = np.zeros(cfg.trunk_dim, dtype=np.int64)
         self.global_step = 0
         self.epsilon = float(cfg.epsilon_start)
 
     def _update_epsilon(self):
-        """Linear decay from epsilon_start to epsilon_end over exploration_fraction."""
         cfg = self.cfg
         duration = max(1, int(cfg.exploration_fraction * cfg.total_frames))
         slope = (cfg.epsilon_end - cfg.epsilon_start) / duration
@@ -224,14 +192,11 @@ class SEALAgent(nn.Module):
 
     # ------------------------------------------------------------------ state
     def reset_episode(self):
-        """Reset encoder caches + traces on episode boundary."""
         self.encoder.reset_cache()
         self.opt.reset()
-        self.swift.reset_all()
+        self.spr_queue.clear()
 
     def warmup_forward(self, obs):
-        """Forward one obs through encoder (advancing caches + thresholds), no
-        learning. Used during normalizer warmup."""
         x = self._to_obs(obs)
         _ = self.encoder(x)
 
@@ -243,120 +208,87 @@ class SEALAgent(nn.Module):
     def _to_obs(self, obs):
         if not isinstance(obs, torch.Tensor):
             obs = torch.from_numpy(np.asarray(obs, dtype=np.float32))
-        # HWC -> CHW: gym image obs are (H, W, C) with H==W==84 and C < 84.
-        # CHW (C, 84, 84) has C < 84 in dim 0, not dim 2, so is left alone.
         if obs.dim() == 3 and obs.shape[0] == obs.shape[1] \
                 and obs.shape[-1] <= obs.shape[0] and obs.shape[-1] != obs.shape[0]:
-            obs = obs.permute(2, 0, 1)  # HWC -> CHW
+            obs = obs.permute(2, 0, 1)
         if obs.dim() == 2:
             obs = obs.unsqueeze(0).unsqueeze(0)
         elif obs.dim() == 3:
-            obs = obs.unsqueeze(0)  # [1,C,H,W]
+            obs = obs.unsqueeze(0)
         return obs.contiguous().float().to(self.device)
 
     # ----------------------------------------------------------- forward/act
     def act(self, obs) -> tuple:
-        """Forward one observation; select an action; return (action, Transition).
-
-        Epsilon-greedy: with probability ε, take a uniform random action
-        (exploration); otherwise take argmax Q(s,a) (greedy). The greedy
-        action is what we LEARN (Q-learning), the random action is what we
-        EXECUTE during exploration. Traces reset on random actions (learn()).
-        """
         x = self._to_obs(obs)
         feats = self.encoder(x)
-        logits, gvf_preds, z = self.heads(feats)
+        logits, z = self.heads(feats)
         is_expl = False
         if np.random.rand() < self.epsilon:
             a = int(np.random.randint(0, self.n_actions))
             is_expl = True
         else:
             a = int(logits.detach().argmax().item())
-        event_mask = self.encoder.first_conv_mask()
         with torch.no_grad():
             f_np = feats.detach().squeeze(0).cpu().numpy()
             self.utility.update_unit_utility(f_np)
             active = (np.abs(f_np) > 1e-3)
             self.since_active[active] = 0
             self.since_active[~active] += 1
-        tr = Transition(logits=logits, gvf_preds=gvf_preds, action=a,
-                        feats=feats.detach(), head_features=z.detach(),
-                        event_mask=event_mask.detach(),
-                        is_exploration=is_expl)
+        tr = Transition(logits=logits, action=a, feats=feats,
+                        head_features=z, obs=x, is_exploration=is_expl)
         return a, tr
 
     # --------------------------------------------------------------- learn
     def learn(self, pending: Transition, r: float,
               next_pending: Transition, done: bool,
               reset_on_done: bool = True):
-        """Streaming TD(λ) update for `pending` using the transition (s,a,r,s').
+        """Streaming TD(λ) Q update + SPR auxiliary update (delayed K steps).
 
-        `next_pending` is the Transition from the next observation (s'); pass
-        None on a terminal step. Bootstrap values are read from it: Q's
-        bootstrap = max_a' Q(s',a') (clipped to ±q_clip), each GVF's bootstrap
-        = that GVF's own prediction at s'. All are 0 if done.
+        Two gradient paths, kept separate so they don't conflict:
+          * Q gradient  → AdaptiveObGD (traced TD(λ), ×δ, κ-bound, utility gate)
+          * SPR gradient → SGD, orthogonalized against Q, norm-bounded
 
-        Two optimizers, split at the control/prediction boundary:
-          * ENCODER + Q HEAD (AdaptiveObGD): traced TD(λ) on the gradient of
-            `loss = -Q(s,a) + Σ_k gvf_weight_k·½(GVF_k - c_k)²`. The Q head
-            lives here (not SwiftTD) because its max_a' Q(s',a') bootstrap is
-            nonlinear in the weights — the deadly-triad offender — and
-            AdaptiveObGD's κ-bound (fixed α that cancels) damps the
-            overestimation cascade instead of amplifying it. The GVF terms
-            shape the encoder representation (game-agnostic).
-          * GVF BANK (SwiftTD): exact True Online TD(λ) + IDBD per-feature
-            step sizes + overshoot bound + step-size decay. Pure linear
-            PREDICTION (each GVF bootstraps from its own next prediction, no
-            max) — the exact setting True Online TD(λ) is valid for.
-            δ_k = c_k + γ·GVF_k(s') − GVF_k(s), each with its own λ.
-
-        δ (Q's) is NOT in the encoder/Q loss (AdaptiveObGD multiplies the
-        gradient by δ internally); SwiftTD carries each GVF's own δ into its
-        linear update.
+        The SPR loss at time t needs target latents from o_{t+1..t+K}, so it
+        is computed K steps late via a fixed-length delay queue (NOT a replay
+        buffer — just K=3 held transitions).
         """
         cfg = self.cfg
         q_sa = pending.logits[0, pending.action]
         v_next_q = 0.0 if done else float(next_pending.logits.detach()[0].max().item())
-        # overestimation guard: clip the bootstrap to the physically possible
-        # return range (Pong returns are ±21).
         v_next_q = max(-cfg.q_clip, min(cfg.q_clip, v_next_q))
         td_err = float(r + cfg.gamma * v_next_q * (0.0 if done else 1.0)
                        - float(q_sa.detach()))
 
         self.last_td_err = td_err
-        self.last_entropy = 0.0          # n/a for Stream Q (epsilon-greedy explores)
+        self.last_entropy = 0.0
         self.last_v = float(q_sa.detach().item())
 
-        # ---- off-policy / terminal trace reset (Stream Q correction) ----
         reset = bool(done and reset_on_done) or pending.is_exploration
 
-        # ---- GVF cumulants (game-agnostic: event mask + reward) ----
-        cumulants = compute_cumulants(pending.event_mask, float(r), self.gvfs)
-        if done:
-            v_next_gvfs = torch.zeros(self.n_gvfs)
-        else:
-            v_next_gvfs = next_pending.gvf_preds.detach().reshape(-1)
+        # ---- Q gradient (for ObGD) ----
+        grads_q = torch.autograd.grad(-q_sa, self.obgd_params, allow_unused=True,
+                                      retain_graph=True)
+        grads_q = [g if g is not None else torch.zeros_like(p)
+                   for g, p in zip(grads_q, self.obgd_params)]
 
-        # ---- encoder + Q head backward + AdaptiveObGD step ----
-        # GVF shaping: MSE between each GVF's prediction and its cumulant,
-        # summed with per-GVF weights. (Semi-gradient: cumulants detached.)
-        gvf_pred = pending.gvf_preds.to(pending.head_features.device).reshape(-1)
-        gvf_loss = 0.5 * ((gvf_pred - cumulants.to(gvf_pred.device)) ** 2)
-        gvf_loss = float(cfg.gvf_weight) * (gvf_loss * torch.tensor(
-            self.gvf_weights, device=gvf_pred.device, dtype=gvf_pred.dtype)).sum()
-        loss = (-q_sa + gvf_loss)
-        grads = torch.autograd.grad(loss, self.obgd_params, allow_unused=True,
-                                    retain_graph=False)
-        grads = [g if g is not None else torch.zeros_like(p)
-                 for g, p in zip(grads, self.obgd_params)]
+        # ---- ObGD step (Q only) ----
         gates = self.utility.update_param_utility(td_err, self.opt.traces)
-        self.opt.step(td_err, grads, reset_traces=reset, update_mask=gates)
+        self.opt.step(td_err, grads_q, reset_traces=reset, update_mask=gates)
 
-        # ---- GVF heads: SwiftTD (True Online TD(λ) + IDBD + bound + decay) ----
-        self.swift.step_gvfs(pending.head_features, cumulants, v_next_gvfs,
-                             done=done, reset=reset)
+        # ---- SPR: enqueue this transition, compute loss if queue is full ----
+        spr_grads = None
+        self.spr_queue.append(pending)
+        if len(self.spr_queue) == cfg.spr_horizon and not done:
+            spr_grads = self._compute_spr_grads()
 
-        # ---- epsilon decay + plasticity: regenerate dead units ----
+        # ---- SPR gradient: orthogonalize against Q, norm-bound, SGD step ----
+        if spr_grads is not None:
+            self._spr_step(spr_grads, grads_q)
+
+        # ---- update the target encoder (EMA) ----
+        self.target_enc.update(self.encoder)
+
+        # ---- epsilon decay + plasticity ----
         self.global_step += 1
         self._update_epsilon()
         if self.global_step % cfg.regen_every == 0:
@@ -364,29 +296,87 @@ class SEALAgent(nn.Module):
 
         return td_err
 
+    def _compute_spr_grads(self):
+        """Compute the SPR loss gradient w.r.t. ALL learnable params (encoder+SPR).
+
+        The transition model unrolls from the OLDEST queued transition's latent,
+        predicting K steps ahead. Targets come from the EMA target encoder run
+        on the queued future observations (stop-gradient).
+        """
+        cfg = self.cfg
+        queue = list(self.spr_queue)
+        K = len(queue)
+        z0 = queue[0].head_features  # [1, 256], in-graph from the online encoder
+
+        # unroll the transition model K steps
+        pred_latents = []
+        z_cur = z0
+        for k in range(K):
+            z_cur = self.spr_transition(z_cur, queue[k].action)
+            pred_latents.append(self.spr_projection(z_cur))
+
+        # target latents from the EMA target encoder (stop-gradient)
+        with torch.no_grad():
+            target_projs = []
+            for k in range(K):
+                z_tgt = self.target_enc.encode(queue[k].obs)  # [1, 256]
+                # apply the SAME projection head (stop-grad) — the paper allows sharing
+                target_projs.append(self.spr_projection(z_tgt))
+
+        loss = spr_loss(pred_latents, target_projs)
+        all_params = self.obgd_params + self.spr_params
+        grads = torch.autograd.grad(loss, all_params, allow_unused=True,
+                                    retain_graph=False)
+        return [g if g is not None else torch.zeros_like(p)
+                for g, p in zip(grads, all_params)]
+
+    def _spr_step(self, spr_grads_all, grads_q):
+        """Orthogonalize the SPR gradient against Q, norm-bound, SGD step.
+
+        spr_grads_all: gradients w.r.t. (obgd_params + spr_params).
+        grads_q:       the Q gradient w.r.t. obgd_params (from the Q path).
+        """
+        cfg = self.cfg
+        n_obgd = len(self.obgd_params)
+        spr_grads_obgd = spr_grads_all[:n_obgd]
+        spr_grads_spr = spr_grads_all[n_obgd:]
+
+        # ---- norm-bound the full SPR gradient before orthogonalization ----
+        total_norm = 0.0
+        for g in spr_grads_obgd + spr_grads_spr:
+            total_norm += float((g.flatten() ** 2).sum().item())
+        total_norm = (total_norm + 1e-12) ** 0.5
+        scale = min(1.0, cfg.spr_grad_clip / total_norm)
+        spr_grads_obgd = [g * scale for g in spr_grads_obgd]
+        spr_grads_spr = [g * scale for g in spr_grads_spr]
+
+        # ---- orthogonalize the encoder part against Q ----
+        spr_orth_obgd = []
+        for g_q, g_spr in zip(grads_q, spr_grads_obgd):
+            dot = float((g_q.flatten() * g_spr.flatten()).sum().item())
+            nq = float((g_q.flatten() ** 2).sum().item()) + 1e-12
+            spr_orth_obgd.append(g_spr - (dot / nq) * g_q)
+
+        # ---- SGD step (encoder part orthogonalized, SPR params unmodified) ----
+        with torch.no_grad():
+            for p, g in zip(self.obgd_params, spr_orth_obgd):
+                p.data.add_(g.reshape(p.shape), alpha=-float(cfg.spr_lr))
+            for p, g in zip(self.spr_params, spr_grads_spr):
+                p.data.add_(g.reshape(p.shape), alpha=-float(cfg.spr_lr))
+
     def _regenerate(self):
-        """Regenerate bottom-1% dead trunk units (ReDo-style)."""
         cfg = self.cfg
         dead = self.utility.dormant_units(self.since_active, cfg.dormant_silence_steps)
         if len(dead) == 0:
             return
         with torch.no_grad():
-            for lin in [self.heads.q, *self.heads.gvf]:
-                lin.weight[:, dead] = 0.0
-            # reinit incoming weights to dead units (EventLinear output rows)
+            self.heads.q.weight[:, dead] = 0.0
             fc_w = self.encoder.fc.weight
             for j in dead:
                 if j < fc_w.shape[0]:
                     b = (1.0 / fc_w.shape[1]) ** 0.5
                     fc_w[j] = torch.empty_like(fc_w[j]).uniform_(-b, b)
             self.since_active[dead] = 0
-        # GVF head weight columns were zeroed above — resync SwiftTD's GVF
-        # weight buffers so they mirror the (frozen) GVF params. β/z/h state
-        # for the affected feature indices persists, matching how AdaptiveObGD's
-        # traces persist across the fc-row/Q-row reinit. (The Q head is owned
-        # by AdaptiveObGD, so it is NOT resynced here — its weights are already
-        # the source of truth.)
-        self.swift.load_from_params()
         self._last_regen = len(dead)
 
     # ----------------------------------------------------------------- stats
@@ -396,5 +386,4 @@ class SEALAgent(nn.Module):
     def dense_flops(self) -> int:
         d = self.encoder.dense_flops()
         d += self.cfg.trunk_dim * self.n_actions * 2
-        d += self.cfg.trunk_dim * self.n_gvfs * 2
         return d
