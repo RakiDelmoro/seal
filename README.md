@@ -1,26 +1,60 @@
 # SEAL — Streaming Event-driven Adaptive Learner
 
-SEAL is a reinforcement learning agent that learns online, one sample at a time, with no replay buffer and no backpropagation-through-time. It combines event-driven neural network layers (only processing what changed in the input) with streaming RL (online, batch-size-1, eligibility traces for temporal credit assignment) to achieve compute-efficient learning on ALE Pong.
+SEAL is a reinforcement learning agent that learns **online, one frame at a
+time, with no replay buffer and no backpropagation through time**. It is a
+recurrent network of spiking neurons (an **LSNN** — LIF + ALIF neurons) trained
+by **reward-based e-prop** (Bellec et al., *Nature Communications* 2020), with
+**symmetric feedback weights** (B_jk = Wout_kjᵀ, weight transport). Target task:
+ALE Pong.
+
+The name **Adaptive** refers to (1) the **adaptive LIF (ALIF) neurons** with
+adapting firing thresholds (spike-frequency adaptation, Eqs. 8–10) and
+(2) **adaptive dormant-unit regeneration** that reinitializes silent spiking
+neurons online — *not* to the feedback weights, which use symmetric e-prop.
+
+The brain-inspired design combines three ingredients from neuroscience that
+e-prop theory tells us how to combine for online network learning through
+gradient descent:
+1. **Eligibility traces** — per-synapse, forward-computed traces of how a
+   weight influenced a neuron's recent spikes (the locally-computable part of
+   the loss gradient).
+2. **Neuron-specific learning signals** — top-down signals L_j routed to each
+   neuron via feedback weights B_jk, conveying the output error.
+3. **A global reward prediction error δ** — gating synaptic plasticity in real
+   time (actor-critic / policy gradient).
 
 ## Architecture
 
 ```
-4 stacked frames [1, 4, 84, 84]  (velocity is in the input, no RNN)
-  → EventConv2d(4→16, 8, s5)  → LeakyReLU + LayerNorm
-  → EventConv2d(16→32, 4, s3) → LeakyReLU + LayerNorm
-  → EventConv2d(32→32, 3, s2) → LeakyReLU + LayerNorm
-  → flatten → EventLinear(256) → LeakyReLU + LayerNorm
-  → heads:
-      value:  Linear(256, 1)
-      policy: Linear(256, 6)    # softmax, adaptive entropy
-      aux:    Linear(256, 3)    # predicts ball position from event mask
+ALE/Pong-v5  (raw RGB)
+   │  NoopReset(30) → MaxAndSkip(4) → EpisodicLife → FireReset
+   │  Resize(84) → Grayscale → NormalizeObservation (streaming Welford, clip ±5)
+   │  → ONE normalized 84×84 frame per env step  (no frame stacking)
+   ▼
+SpikingCNN (fixed-weight stride-conv front-end)
+   │  Conv(1→32, 8, s5) → LeakyReLU → Conv(32→64, 4, s3) → LeakyReLU
+   │  rectified-proportional rate coding → input spike trains  [1600 units]
+   ▼
+LSNN recurrent core  (sim_ms_per_step = 4 ms of sub-stepping at dt = 1 ms)
+   │  240 LIF + 160 ALIF neurons, Win [400,1600], Wrec [400,400]
+   │  Eligibility traces ε_ji (Eq. 14/22-25) updated each ms, forward-only
+   ▼
+Leaky readout (Eq. 11)  → actor logits [6] + critic V [1]
+   │  softmax policy π(a|y) → sample action
+   ▼
+env.step(a) → r, next_obs  →  δ = r + γV' − V
+   │
+   ├── e-prop on Win/Wrec:  ΔW = η·δ·F_γ(L_j · ε̄_ji)   (Eq. 5/36)
+   ├── autograd SGD on readout (actor-critic loss)
+   └── B_jk = Wout_kjᵀ  (symmetric e-prop, read live — no separate update)
+   │
+   discard sample  →  loop
 ```
 
-**Event-driven encoder:** Each conv layer caches its previous output and only processes pixels that changed above an adaptive threshold (homeostatic). Compute scales with activity, not model size. Analytic FLOP savings are reported per step.
-
-**Streaming RL:** ObGD optimizer (overshooting-bounded gradient descent) on the event encoder, eligibility traces (λ=0.8), actor-critic with adaptive entropy bonus. **SwiftTD** (Javed et al. RLC 2024) on the linear heads — True Online TD(λ) + per-feature IDBD step-size optimization + overshoot bound on the eligibility vector + step-size decay, exact where it applies (linear). One forward pass per observation, one update per step, sample discarded immediately.
-
-**Aux task:** A game-agnostic bank of General Value Functions (GVFs) — linear TD(λ) predictions of discounted future cumulants (motion density, positive reward, negative reward, motion spread) whose cumulants come only from the event mask + reward. Replaces the old Pong-specific ball-position aux; transfers unchanged across games. Learned by SwiftTD alongside the Q head.
+**No BPTT.** Temporal credit lives in the **forward eligibility traces** (held
+in the layer, not the optimizer). Velocity/temporal context lives in the
+**recurrent LSNN state** (no frame stack). This is what makes SEAL *streaming*:
+O(1) memory beyond the model weights and the per-synapse eligibility vectors.
 
 ## Project Structure
 
@@ -28,29 +62,28 @@ SEAL is a reinforcement learning agent that learns online, one sample at a time,
 seal/
   config.py                # all hyperparameters (single dataclass)
   train.py                 # entry point: headless training
-  watch.py                 # entry point: training with live Pygame GUI
+  play.py                  # entry point: greedy inference from checkpoint
   plotting.py              # result plots
   model/
-    agent.py               # StreamingActorCritic (encoder + heads + step logic)
-    event_layers.py        # EventConv2d, EventLinear (incremental delta-conv)
-    thresholds.py          # HomeostaticThreshold (adaptive event gate)
-    optimizers.py          # ObGD (paper Algorithm 3, verbatim) — encoder
-    swift_td.py            # SwiftTD (Javed et al. RLC 2024) — linear heads
-    gvf.py                 # game-agnostic GVF bank (Horde/UNREAL-style aux)
-    traces.py              # eligibility trace mechanism (docs; traces in ObGD)
-    utility.py             # UtilityTracker + dead-unit regeneration
-    sparse_init.py         # 90% sparse initialization (paper Appendix F)
-    metrics.py             # FLOP counter, aux targets, CSV logger, dormant tracking
+    agent.py               # SEALAgent (encoder + core + heads + e-prop step)
+    neurons.py             # LIF, ALIF cells (Eqs. 6-10) + pseudo-derivative ψ
+    spiking_conv.py        # fixed stride-conv front-end -> input spike trains
+    lsnn.py                # recurrent LSNN core (Win, Wrec, eligibility traces)
+    eligibility.py         # ε-vector recursion (Eq. 14), ε-trace (Eqs. 22-25)
+    readout.py             # leaky actor + critic heads (Eq. 11), autograd-trained
+    broadcast.py           # symmetric B_jk = Wout_kjᵀ feedback weights (live view)
+    eprop_optimizer.py     # ΔW = η·δ·F_γ(tag); episode-length η schedule
+    utility.py             # dormant spiking-unit regeneration
+    metrics.py             # CSV logger, spike-rate, policy entropy
   env/
-    envs.py                # make_env, EnvSpec, FrameStackWrapper, warmup
-    envs_atari.py          # vendored Atari wrappers (NoopReset, FireReset, EpisodicLife)
+    envs.py                # make_env, EnvSpec, warmup (single-frame pipeline)
+    envs_atari.py          # vendored Atari wrappers
     norm_wrappers.py        # streaming NormalizeObservation (Welford, no buffer)
   tests/
-    test_stage0_envs.py    # env harness: shapes, episode boundaries, frame recorder
-    test_stage1_encoder.py # event encoder: exactness (1e-5), sparsity, heatmap, drift
-    test_stage2_3_rl.py    # RL smoke: dense + SEAL stability, IDBD optimizer
-  README.md
-  RUNBOOK.md
+    test_neurons.py        # LIF/ALIF dynamics vs analytic α, ρ; reset; ψ window
+    test_eligibility.py    # Σ_t L·ε ≈ finite-diff dE/dW  (the e-prop theorem)
+    test_eprop_pong.py     # RL smoke: no NaN, B_jk drifts, tags reset, sparse firing
+  docs/ARCHITECTURE_FLOW.md
 ```
 
 ## Quick Start
@@ -58,51 +91,60 @@ seal/
 ```bash
 pip install gymnasium ale-py pygame torch
 
-# train with live GUI (watchable):
-python watch.py --frames 5000000 --seed 0 --fps 60
-
-# train headless (faster):
+# train headless:
 python train.py --frames 5000000 --seed 0
 
-# resume from checkpoint:
-python watch.py --frames 5000000 --seed 0 --fps 60 --resume results/seal-pong_latest.pt
+# train with live GUI:
+python train.py --frames 5000000 --seed 0 --gui --fps 60
 
-# generate plots:
-python plotting.py
+# resume from checkpoint:
+python train.py --frames 5000000 --seed 0 --resume results/seal-50.pt
+
+# play greedily from a checkpoint:
+python play.py --checkpoint results/seal-pong_best.pt
 ```
 
 ## Key Components
 
-### Event-Driven Encoder (`model/event_layers.py`)
-- **EventConv2d / EventLinear:** Incremental layers that compute `out = out_prev + W(delta * mask)` where `delta = x - x_prev` and `mask` is a straight-through thresholded gate.
-- **Exactness invariant:** With threshold θ=0, output matches dense conv to 1e-5. Verified by Stage-1 tests.
-- **FLOP accounting:** Analytic FLOPs reported per step via active-output-location count (not wall-clock).
+### Spiking neurons (`model/neurons.py`)
+- **LIF** (Eq. 6-7): `v_{t+1} = α·v_t + i_syn - z·v_th`, `z = H(v - v_th)`.
+- **ALIF** (Eq. 8-10): LIF + adapting threshold `A = v_th + β·a`, `a_{t+1} = ρ·a + z`.
+- **Pseudo-derivative** ψ = (γ_pd/v_th)·max(0, 1 − |v−A|/v_th) (γ_pd = 0.3), the
+  surrogate gradient for the non-differentiable spike. Zeroed during refractory.
 
-### Homeostatic Threshold (`model/thresholds.py`)
-- Adapts θ per layer to keep event rate in a target band (0.5–3% for ALE Pong).
-- Dead-layer recovery: if a layer fires 0% for 100 steps, θ is cut by 0.3× until the layer wakes.
+### Eligibility traces (`model/eligibility.py`)
+- The locally-computable part of `dE/dW_ji` (Eq. 1/3): `ε_ji^t = ψ_j·ε_vec_ji^t`.
+- LIF (Eq. 22-23): `ε_vec = α·ε_vec + z_pre` (low-pass of presynaptic spikes).
+- ALIF (Eq. 24-25): 2-D `ε_vec = [ε_v, ε_a]`; the adaptation component `ε_a`
+  decays with the slow time constant ρ, providing **highways into the future**
+  for temporal credit assignment.
+- Validated by finite-difference/autograd checks (`test_eligibility.py`).
 
-### ObGD Optimizer (`model/optimizers.py`)
-- Paper Algorithm 3, verbatim (Elsayed et al. 2024).
-- Overshooting-bounded: per-parameter update capped at 1/κ.
-- Effective step size α_eff = 1/(κ·δ̄·‖z‖₁) — governed by trace statistics, not nominal α.
+### Symmetric e-prop feedback (`model/broadcast.py`)
+- **Symmetric e-prop** (default & only mode): B_jk = Wout_kjᵀ, read live from
+  the readout weights at each `learning_signal()` call. This is the variant the
+  paper used for the Atari Pong result (Fig. 4b/d). It makes L_j equal to the
+  exact partial derivative ∂E/∂z_j, giving the strongest, lowest-noise learning
+  signal — at the cost of weight transport (biologically implausible, but
+  maximally sample-efficient). B is not a separate parameter and has no
+  plasticity rule; it tracks Wout automatically.
 
-### Utility Tracker (`model/utility.py`)
-- Per-parameter utility tracking: weights with low utility are gated off.
-- Dead-unit regeneration: bottom 1% utility units are reinitialized every 25k steps.
+### Reward-based e-prop (`model/eprop_optimizer.py`, `model/agent.py`)
+- Plasticity rule (Eq. 5/36): `ΔW_ji = η·δ_t·F_γ(L_j^t · ε̄_ji^t)`.
+- δ = r + γV_{t+1} − V_t (reward prediction error).
+- L_j (Eq. 37): `Σ_k B_jk·(π_k − 1_{a=k}) + c_V·B_j^V` — neuron-specific.
+- Readout on autograd/SGD (feedforward, Eq. 11); Win/Wrec on e-prop.
+- Stability via **episode-length schedule** (increasing lengths, η ∝ 1/√len).
 
-### Environment (`env/`)
-- ALE Pong, 84×84 grayscale, 4-frame stacking, MaxAndSkip(4), EpisodicLife.
-- Streaming Welford observation normalization (no buffer, clip ±5).
-- No reward scaling (Pong rewards are already ±1).
+### Plasticity (`model/utility.py`)
+- Dormant = no spike for `dormant_silence_ms`. Every `regen_every` steps, the
+  longest-silent units are reinitialized (ReDo-style), combating
+  loss-of-plasticity in spiking nets.
 
 ## Tech Stack
-
-- PyTorch
-- Gymnasium + ALE-py
-- Pygame (GUI for watch mode)
+- PyTorch, Gymnasium + ALE-py, Pygame (GUI).
 
 ## References
-
-- Elsayed, Vasan & Mahmood, "Streaming Deep Reinforcement Learning Finally Works", arXiv:2410.14606, 2024.
-- Javed, Sharifnassab & Sutton, "SwiftTD: A Fast and Robust Algorithm for Temporal Difference Learning", RLC 2024 (RLJ_RLC_2024_111).
+- Bellec, Scherr, Subramoney et al., "A solution to the learning dilemma for
+  recurrent networks of spiking neurons", *Nature Communications* 11:3625
+  (2020). https://doi.org/10.1038/s41467-020-17236-y
