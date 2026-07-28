@@ -1,57 +1,83 @@
-"""Utility tracker + dead-unit regeneration.
+"""Plasticity: dormant spiking-unit regeneration (ReDo-style).
 
-Two plasticity mechanisms:
-  1. Per-parameter UTILITY GATE: a scalar running stat per parameter tensor
-     (mean |delta*trace|). If it falls below tau_low, that parameter gets NO
-     ObGD update this step.
-  2. Per-UNIT REGENERATION (in agent._regenerate): at fixed intervals, the
-     bottom utility quartile of TRUNK units that have been silent for a long
-     time have their incoming weights reinitialized and outgoing weights
-     zeroed (ReDo-style dead-unit resurrection).
+A spiking neuron is "dormant" if it has not fired for `dormant_silence_ms`
+milliseconds. Every `regen_every` env steps, the bottom `regen_frac` of
+dormant units are reinitialized: incoming weights (Win, Wrec rows) get fresh
+random values, outgoing weights (Wrec columns, readout rows) are zeroed.
 
-Per-unit utility proxy: a running per-unit activation magnitude for the trunk
-(256 units). Units with low activation utility AND long silence (dormant) are
-regeneration candidates.
+This combats the loss-of-plasticity problem in online learning and is
+especially important for spiking nets, where dead neurons never contribute
+eligibility traces and thus never recover on their own.
 """
 from __future__ import annotations
-import numpy as np
 import torch
+import numpy as np
 
 
 class UtilityTracker:
-    """Per-parameter scalar utility + gate; per-unit trunk utility."""
-    def __init__(self, params, decay: float = 0.9999, tau_low: float = 1e-6,
-                 n_trunk_units: int = 256):
-        self.params = list(params)
-        self.decay = float(decay)
-        self.tau_low = float(tau_low)
-        # scalar utility per parameter
-        self.utility = [torch.zeros(1, dtype=torch.float32) for _ in self.params]
-        # per-unit trunk utility (running mean |activation|)
-        self.unit_utility = np.zeros(n_trunk_units, dtype=np.float64)
-        self.unit_count = 0
+    """Tracks spike-silence per LSNN neuron and regenerates dormant units.
 
-    def update_param_utility(self, td_error: float, traces):
-        """Per-parameter utility. Returns the gate list (bool per param)."""
-        gates = []
+    Args:
+        n_total: LSNN population size
+        regen_every: env steps between regeneration sweeps
+        dormant_silence_ms: ms of silence to count a neuron dormant
+        regen_frac: fraction of dormant units to regenerate each sweep
+        win_scale, wrec_scale: init scales for regenerated incoming weights
+    """
+    def __init__(self, n_total: int, regen_every: int = 25_000,
+                 dormant_silence_ms: float = 10_000.0, regen_frac: float = 0.01,
+                 win_scale: float = 0.02, wrec_scale: float = 0.01):
+        self.n_total = n_total
+        self.regen_every = int(regen_every)
+        self.dormant_silence_ms = float(dormant_silence_ms)
+        self.regen_frac = float(regen_frac)
+        self.win_scale = float(win_scale)
+        self.wrec_scale = float(wrec_scale)
+        self.since_spike_ms = np.zeros(n_total, dtype=np.float64)
+        self.last_n_regen = 0
+
+    def observe(self, z: torch.Tensor, sim_ms: int):
+        """Update silence counters from a step's spike vector."""
+        fired = (z.numpy() > 0.5)
+        self.since_spike_ms[fired] = 0.0
+        self.since_spike_ms[~fired] += float(sim_ms)
+
+    def dormant_units(self) -> np.ndarray:
+        """Indices of neurons silent longer than the threshold."""
+        return np.where(self.since_spike_ms >= self.dormant_silence_ms)[0]
+
+    def maybe_regen(self, step: int, core, readout) -> int:
+        """If due, regenerate a fraction of dormant units. Returns n regenerated."""
+        if step == 0 or step % self.regen_every != 0:
+            return 0
+        dormant = self.dormant_units()
+        if len(dormant) == 0:
+            return 0
+        n_regen = max(1, int(self.regen_frac * self.n_total))
+        n_regen = min(n_regen, len(dormant))
+        # pick the longest-silent dormant units
+        order = np.argsort(-self.since_spike_ms[dormant])[:n_regen]
+        dead = torch.from_numpy(dormant[order]).long()
         with torch.no_grad():
-            for i, t in enumerate(traces):
-                inst = (float(td_error) * t.detach()).abs().mean()
-                self.utility[i].mul_(self.decay).add_((1.0 - self.decay) * inst)
-                gates.append(bool(self.utility[i].item() > self.tau_low))
-        return gates
+            # incoming Win rows: reinit
+            for j in dead:
+                jv = int(j)
+                core.Win.data[jv] = torch.empty_like(core.Win.data[jv]).uniform_(
+                    -self.win_scale, self.win_scale)
+            # incoming Wrec rows: reinit
+            for j in dead:
+                jv = int(j)
+                core.Wrec.data[jv] = torch.empty_like(core.Wrec.data[jv]).uniform_(
+                    -self.wrec_scale, self.wrec_scale)
+            core.Wrec.data.fill_diagonal_(0.0)
+            # outgoing: zero readout columns (actor + critic) + Wrec columns
+            readout.Wout_actor.data[:, dead] = 0.0
+            readout.Wout_critic.data[:, dead] = 0.0
+            core.Wrec.data[:, dead] = 0.0
+            core.Wrec.data.fill_diagonal_(0.0)
+        self.since_spike_ms[dead.numpy()] = 0.0
+        self.last_n_regen = n_regen
+        return n_regen
 
-    def update_unit_utility(self, trunk_acts: np.ndarray):
-        """Running mean |activation| per trunk unit (batch-1)."""
-        a = np.abs(trunk_acts.astype(np.float64))
-        self.unit_count += 1
-        self.unit_utility += (a - self.unit_utility) / self.unit_count
-
-    def dormant_units(self, silence_counts: np.ndarray, silence_steps: int) -> np.ndarray:
-        """Indices of units silent > silence_steps AND in bottom utility quartile."""
-        silent = silence_counts > silence_steps
-        if not silent.any():
-            return np.array([], dtype=int)
-        util = self.unit_utility
-        thr = np.quantile(util[silent], 0.75) if silent.sum() > 4 else util.max()
-        return np.where(silent & (util <= thr))[0]
+    def dormant_frac(self) -> float:
+        return float((self.since_spike_ms >= self.dormant_silence_ms).mean())

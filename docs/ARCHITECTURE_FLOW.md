@@ -1,179 +1,120 @@
 # SEAL — Architecture Flow Chart
 
 SEAL = **S**treaming **E**vent-driven **A**daptive **L**earner.
-One observation in → one action out → one update applied → sample discarded.
-No replay buffer. No BPTT. No RNN. Batch-size 1, online forever.
+A recurrent network of spiking neurons (LSNN) trained online by reward-based
+e-prop. One frame in → one action out → one e-prop update → sample discarded.
+No replay buffer. No BPTT. No frame stacking. Batch-size 1, online forever.
 
 ```
 ALE/Pong-v5  (raw RGB)
    │  NoopReset(30) → MaxAndSkip(4) → EpisodicLife → FireReset
    │  Resize(84) → Grayscale → NormalizeObservation (streaming Welford, clip ±5)
-   │  FrameStack(4)  →  obs [4, 84, 84]   (t, t-1, t-2, t-3; velocity in channels)
+   │  → ONE normalized 84×84 frame per env step  (no frame stacking)
    ▼
-_to_obs  HWC → CHW → [1, 4, 84, 84]
-   │
-   │  ┌─ warmup (once, 1000 random-action frames, no learning) ─────────────┐
-   │  │   primes Welford stats + per-element θ before any weight update      │
-   │  │   90% sparse init applied to whole net                               │
-   │  └──────────────────────────────────────────────────────────────────────┘
+┌───────────────── SpikingCNN front-end (TRAINABLE, paper Fig. 4b) ──────────┐
+│  Conv(1→32, 8, s5) → LeakyReLU → Conv(32→64, 4, s3) → LeakyReLU            │
+│  → flatten [1600] → normalize (zero-mean/unit-std)                          │
+│  rectified-proportional rate coding:  p = max_p·tanh(gain·relu(feats)/max_p)│
+│  → Bernoulli spike  x_i^t [1600]   (sparse; only above-average features)   │
+│  (trained via input-layer learning signal L_in = Winᵀ·L_j + ObGD;           │
+│   config train_cnn=False reverts to frozen-random for ablation)            │
+└────────────────────────────────────────────────────────────────────────────┘
+   │  input spikes x_i^t  [1600]
    ▼
-┌─────────────────────── Event-Driven Encoder (incremental) ─────────────────────┐
-│                                                                                │
-│  each EventConv2d / EventLinear layer, per frame:                              │
-│                                                                                │
-│     delta = x − x_prev            (cached from previous frame)                 │
-│        │                                                                       │
-│        │  PerPixelThreshold.observe:  θ[e] = k · EWMA(|delta[e]|)              │
-│        │  (θ = 0 during warmup → output ≡ dense conv, exact to 1e-5)          │
-│        ▼                                                                       │
-│     mask = |delta| > θ           (hard event gate, forward)                    │
-│        │  straight-through:  mask + (σ(delta) − σ(delta).detach())             │
-│        ▼                                                                       │
-│     d = delta · mask_st          (only changed elements pass)                  │
-│        │                                                                       │
-│        ▼                                                                       │
-│     out = out_prev + W(d)        (incremental; bias applied once at t=0)       │
-│        │                                                                       │
-│        └── cache x_prev, out_prev for next step  (episode reset → recompute)   │
-│                                                                                │
-│  EventConv2d(4→32,  8, s5)  → LeakyReLU + LayerNorm  ┐                         │
-│  EventConv2d(32→64, 4, s3)  → LeakyReLU + LayerNorm  ├ per-element θ each      │
-│  EventConv2d(64→64, 3, s2)  → LeakyReLU + LayerNorm  │                         │
-│  flatten → EventLinear(→256) → LeakyReLU + LayerNorm ┘                         │
-│                                                                                │
-│  FLOP accounting: active-output-locations × k² × in × out × 2  (reported,      │
-│  not wall-clock)  →  analytic 10–50× savings vs dense conv.                    │
-└────────────────────────────────────────────────────────────────────────────────┘
-   │  feats h [256]
+┌─────────────── LSNN recurrent core (sim_ms_per_step = 4 ms) ───────────────┐
+│  Sub-steps at dt = 1 ms. Population: 240 LIF + 160 ALIF = 400 neurons.     │
+│  Weights:  Win [400,1600] (input→core),  Wrec [400,400] (recurrent).       │
+│                                                                            │
+│  EACH ms sub-step:                                                         │
+│    i_syn = Wrec · z_prev + Win · x              (synaptic input currents)  │
+│    LIF:   v ← α·v + i_lif;  z_lif = H(v - v_th);  reset v -= z·v_th        │
+│    ALIF:  A = v_th + β·a;  v ← α·v + i_alif;  z_alif = H(v - A)            │
+│           reset v -= z·A;  a ← ρ·a + z            (Eq. 6-10)               │
+│    ψ = (γ_pd/v_th)·max(0, 1-|v-A|/v_th)          (pseudo-derivative)       │
+│                                                                            │
+│  ELIGIBILITY TRACES (forward, per-synapse, Eq. 14/22-25):                  │
+│    LIF:   ε_vec ← α·ε_vec + z_pre;        ε_ji = ψ·ε_vec   (Eq. 22-23)     │
+│    ALIF:  ε_v  ← α·ε_v + z_pre                                   (Eq. 22) │
+│           ε_a  ← ψ·z_pre + (ρ - ψ·β)·ε_a        (Eq. 24, the slow trace)   │
+│           ε_ji = ψ·(ε_v - β·ε_a)                (Eq. 25)                   │
+│  ↑ ε_a decays with the SLOW adaptation time constant → "highways into the  │
+│    future" that let δ at the end of an episode reach spikes from long ago. │
+│                                                                            │
+│  After 4 ms:  spike_rate = spike_count / 4   [400]  (readout input)        │
+└────────────────────────────────────────────────────────────────────────────┘
+   │  z_rate [400],  eligibility ε̄_win [400,1600], ε̄_wrec [400,400]
    ▼
-Heads  ← LayerNorm(256, affine-free)   (no learnable params → heads are PURE LINEAR)
-   │  Q head:   Linear(256→6)   (Q-values per action; Q IS the value, no V head)
-   │  aux head: Linear(256→3)   (ball_x, ball_y, paddle_contact)
-   │  z = ln(h)  [256]  ← the LINEAR head input, SwiftTD's feature vector φ
-   ▼
-aux_targets  ← extract_aux_targets(first-conv event mask centroid)   (free label)
-   │
-   ▼
-ε-greedy action selection
-   │  ε: 1.0 → 0.01 linear over 5% of total_frames
-   │  greedy:  a = argmax Q(s,a)        ← what we LEARN (Stream Q, off-policy)
-   │  explore: a = uniform random        ← what we EXECUTE (is_exploration=True)
-   ▼
-Transition{logits, aux, action, feats, head_features=z, aux_targets, is_expl}  (held "pending")
+┌─────────────────── Leaky readout (Eq. 11, autograd-trained) ───────────────┐
+│  y ← κ·y + Wout·z_rate + b        (leaky output neurons)                   │
+│  actor logits = y[:6]  →  softmax → π(a|y)  →  sample action a             │
+│  critic V     = y[6]            (scalar value prediction)                  │
+│  (feedforward — ordinary autograd + SGD; e-prop NOT needed for readout)    │
+└────────────────────────────────────────────────────────────────────────────┘
    │  action a
    ▼
-env.step(a)  → next_obs, r, term, trunc
-   │
-   │  next_obs re-enters encoder → next logits
-   │  bootstrap:  v_next = max_a' Q(s',a')   (0 if done; greedy, off-policy)
+env.step(a) → next_obs, r, term, trunc
+   │  next_obs re-enters SpikingCNN → LSNN → readout → next V'
    ▼
-┌───────────────────────── Streaming TD(λ) Learn (agent.learn) ──────────────────┐
-│  Two optimizers, one per the paper's neural recipe:                            │
-│    ENCODER → AdaptiveObGD   (traced TD(λ), κ-bound)                            │
-│    HEADS   → SwiftTD        (True Online TD(λ) + IDBD + bound + decay)          │
-│                                                                                │
-│  δ = r + γ · v_next · (1−done) − Q(s,a)            (scalar TD error, Q head)   │
-│     γ = 0.99, λ = 0.8                                                          │
-│  bootstrap: v_next = max_a' Q(s',a') from next_pending (0 if done)             │
-│                                                                                │
-│  reset traces?  yes if (done) OR (is_exploration)   ← off-policy correction    │
-│                                                                                │
-└────────────────────────────────────────────────────────────────────────────────┘
-   │
-   ├─── ENCODER path ────────────────────────────────────────────────────────────┐
-   │                                                                            │
-   ▼                                                                            │
-┌───────────────────── AdaptiveObGD  (paper Algorithm 3, verbatim) ───────────────┐
-│  Elsayed et al. 2024, "Streaming Deep RL Finally Works", arXiv:2410.14606      │
-│  (applied to the event encoder / trunk params only)                            │
-│                                                                                │
-│  loss = −Q(s,a) + gvf_weight · Σ_k w_k · ½(GVF_k − c_k)²   (encoder grad src)  │
-│        δ is NOT in the loss — ObGD multiplies the gradient by δ internally     │
-│  grads = autograd.grad(loss, encoder_params)    ← one-step, no recurrent graph │
-│                                                                                │
-│  trace    e[p] ← λγ · e[p] + grad[p]                  (eligibility trace)      │
-│  2nd mom  v[p] ← β2 · v[p] + (1−β2)·(δ·e[p])²        (Adam-style, per-param)   │
-│  v̂       = v / (1 − β2^t)                             (bias correction)       │
-│  z_sum   = Σ |e[p] / √(v̂[p]+ε)|                      (normalized, O(n_params))│
-│  δ̄       = max(|δ|, 1)                                                       │
-│  α_eff   = α / (κ · δ̄ · z_sum)   if product > 1 else α   (overshooting bound) │
-│  W[p]   −= α_eff · δ · e[p] / √(v̂[p]+ε)              (gated by utility)        │
-│                                                                                │
-│  κ = 2.0, β2 = 0.999, ε = 1e-8.  κ-bound = SEAL's overcorrection protection     │
-│  for the nonlinear encoder (the paper does NOT apply True Online to conv        │
-│  kernels — SwiftTD's exactness is linear-only).                                │
-└────────────────────────────────────────────────────────────────────────────────┘
-   │                                                                            │
-   └────────────────────────────────────────────────────────────────────────────┘
-   │
-   ├─── HEADS path ──────────────────────────────────────────────────────────────┐
-   │                                                                            │
-   ▼                                                                            │
-┌───────────────────── SwiftTD  (Javed et al. RLC 2024, Algorithm 1) ─────────────┐
-│  (applied to the LINEAR heads — exact True Online TD(λ) setting)               │
-│  one independent SwiftTD linear learner per output row over φ = [z (256), 1]    │
-│                                                                                │
-│  Q head:  only the TAKEN action's learner runs the full step each env step     │
-│           (δ = r + γ·max_a'Q(s',a') − Q(s,a);  others' traces just decay γλ)   │
-│           traces reset on done / exploration (off-policy, Stream Q)            │
-│  GVF bank: all 4 learners step every step (off-policy value predictions,       │
-│            not action-conditioned). δ_k = c_k + γ·GVF_k(s') − GVF_k(s), each    │
-│            with its own λ (0.9 / 0.5 / 0.5 / 0.9). bootstrap = the GVF's own    │
-│            next prediction (0 if terminal). cumulants from event mask + reward. │
-│                                                                                │
-│  TRUE ONLINE TD(λ)  — the Tier-1 trace upgrade, exact here:                    │
-│    δw[i] = δ′·z[i] − z_δ[i]·v_δ       (v_δ carried: prediction change last    │
-│    w[i] += δw[i]                        update; removes the double-counting)   │
-│                                                                                │
-│  IDBD step-size optimization  (per-feature β[i], loss-aware):                  │
-│    β[i] += θ/e^β · (δ′ − v_δ)·p[i]    (grow steps of useful features, shrink  │
-│    α[i] = e^β[i];  clip β to [ln η_min, ln η]   irrelevant ones)               │
-│                                                                                │
-│  OVERSHOOT BOUND  (correction ratio τ = Σ α[i]φ[i]² capped at η):              │
-│    z_δ[i] = min(1, η/τ)·e^β[i]·φ[i]   (eligibility increment scaled so a step  │
-│                                        never moves the prediction past target) │
-│                                                                                │
-│  STEP-SIZE DECAY  (bound fired, τ > η):                                        │
-│    β[i] += φ[i]²·ln(ε_decay)         (shrink the steps that caused overshoot)  │
-│                                                                                │
-│  θ=1e-3, η=0.1, ε_decay=0.99, α_init=1e-7, η_min=1e-15, λ=0.8, γ=0.99.         │
-│  Per-learner state: z,h,htemp,hold,p,z̄,z_δ,β (257) + v_old,v_δ (scalars).      │
-└────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────── Reward-based e-prop update (Eq. 5/36) ──────────────────┐
+│  δ = r + γ·V'·(1−done) − V                 (reward prediction error)       │
+│                                                                            │
+│  Learning signal L_j (Eq. 37, neuron-specific):                            │
+│    policy_err_k = π_k − 1_{a=k};   critic_err = V' − V                     │
+│    L_j = Σ_k B_jk·policy_err_k + c_V·B_j^V·critic_err                      │
+│    where B_jk = Wout_kjᵀ  (symmetric e-prop, read live — weight transport)  │
+│                                                                            │
+│  e-prop tag (F_γ low-pass filter, per-synapse):                            │
+│    tag_ji ← γ·tag_ji + L_j · ε̄_ji                                          │
+│                                                                            │
+│  Weight update (Win, Wrec):                                                │
+│    W_ji += η·δ·tag_ji               (η scaled by 1/√max_episode_len)      │
+│    (grad_clip safety blanket on |η·δ·tag|)                                 │
+│                                                                            │
+│  Readout update (autograd, actor-critic):                                  │
+│    loss = -log_prob·δ + c_V·½δ² - entropy_coef·H(π)                        │
+│    SGD step on Wout, b                                                     │
+│                                                                            │
+│  Symmetric e-prop feedback:                                               │
+│    B_jk = Wout_kjᵀ  (live view; no separate parameter, no plasticity)      │
+│    (L_j equals the exact partial derivative ∂E/∂z_j — strongest signal)    │
+└────────────────────────────────────────────────────────────────────────────┘
    │  global_step++
+   ├── dormant-unit regen every regen_every steps (utility.py)
    ▼
-┌───────────────────────── Plasticity (model/utility.py) ─────────────────────────┐
-│                                                                                │
-│  per-unit:   unit_utility ← running mean |feats[256]|                           │
-│              since_active[active]=0 else +1      (silence counter)              │
-│                                                                                │
-│  every 25k steps → ReDo-style regeneration:                                    │
-│     dormant = silent > 10k steps  AND  low utility                             │
-│     reinit incoming weights to dead units, zero outgoing  (revive dead units)  │
-│                                                                                │
-└────────────────────────────────────────────────────────────────────────────────┘
+CSV log row  (step, episode, return, td_err, v, spike_rate_hz,
+              policy_entropy, b_drift, tag_norm_win, tag_norm_wrec,
+              dormant_frac, max_episode_len)
    │
    ▼
-CSV log row  (step, episode, return, td_err, event_flops, dense_flops,
-              event_rate, frac_weights_updated, dormant_frac, feat_rank, α_eff, θ)
-   │
-   ▼
-pending ← next_pending,  a ← a_next     ─── loop back to env.step ───┐
-                                                                     │
-   if done:  reset_episode (clear encoder caches + traces), env.reset│
-                                                                     │
-   ▲────────────── x_prev / out_prev cached per layer ───────────────┘
+pending ← next_state,  a ← a_next  ─── loop back to env.step ───┐
+                                                                │
+   if done:  reset_episode (clear LSNN state + traces + tags),  │
+             env.reset                                          │
+                                                                │
+   ▲──────── LSNN eligibility traces held per-synapse ──────────┘
 ```
 
 ## The whole loop in one line
 
 ```
-obs ─▶ event encoder ─▶ Q ─▶ argmax+ε ─▶ env.step ─▶ δ ─▶ encoder:ObGD  ─▶ discard sample
-                ▲                                              │  heads:SwiftTD
-                └────────── cache x_prev / out_prev ───────────┘
+frame ─▶ SpikingCNN ─▶ LSNN(+eligibility) ─▶ readout ─▶ sample a ─▶ env.step
+                         ▲                                            │
+                         └── ε_ji computed forward (Eq. 14/22-25) ────┘
+
+δ = r + γV' - V ─▶ L_j = B_jk·err (B=Woutᵀ) ─▶ tag ← γ·tag + L_j·ε̄ ─▶ W += η·δ·tag
+                                                          ──── discard ────┘
 ```
 
-Every box runs **once per environment step**, batch-size 1, sample used once and
-discarded. Temporal credit assignment lives in the **eligibility traces** (held
-in the optimizer), not in any recurrent graph. Velocity lives in the **4 stacked
-frames**, not in an RNN. This is what makes SEAL *streaming*: O(1) memory beyond
-the model weights and the cached previous input/output per layer.
+## Why this is streaming (and BPTT-free)
+
+Every box runs **once per environment step**, batch-size 1. Temporal credit
+assignment lives in the **forward eligibility traces** (the slow ALIF
+component ε_a reaches far back into the past), NOT in any backward pass. The
+neuron-specific learning signal L_j routes the output error to each neuron via
+**symmetric feedback weights B_jk = Wout_kjᵀ** (weight transport; the variant
+the paper used for Atari Pong, Fig. 4b/d). The reward prediction error δ gates
+the synaptic update in real time. O(1) memory beyond model weights + per-synapse
+eligibility vectors.
+
+**Adaptive** in the name refers to the ALIF adapting neurons and the dormant-
+unit regeneration, not to the feedback weights.

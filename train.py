@@ -1,8 +1,8 @@
-"""SEAL training entrypoint.
+"""SEAL training entrypoint — reward-based e-prop on an LSNN, ALE Pong.
 
-One sample per env step, used once, then discarded. No replay, no target net,
-no minibatches. Streams online: event-driven encoder + Stream Q (AdaptiveObGD)
-+ SPR auxiliary representation + utility gate + dead-unit regen.
+Online, one frame per env step, sample used once and discarded. No BPTT, no
+replay. Eligibility traces (forward) + neuron-specific learning signals
+(symmetric feedback B_jk = Wout_kjᵀ) + reward prediction error δ implement e-prop.
 
 Usage:
   # headless (fast)
@@ -11,68 +11,85 @@ Usage:
   # with live Pygame GUI
   python train.py --frames 5000000 --seed 0 --gui --fps 60
 
-  # resume from checkpoint
+  # resume from a rotating checkpoint
   python train.py --frames 5000000 --seed 0 --resume results/seal-pong_latest.pt
+
+Checkpoints: a rotating ring of the last --ckpt-keep (default 5) episode
+checkpoints named seal-{n_episodes}.pt, saved every --ckpt-every-ep episodes.
+A seal-pong_best.pt keeps the best-return snapshot.
 """
 from __future__ import annotations
-import os, time, argparse, collections
+import os, re, time, argparse, collections
 import numpy as np
 import torch
+
+from tqdm import tqdm
 
 from config import config_from_preset
 from env.envs import make_env, warmup, find_norm_stats, restore_norm_stats
 from model.agent import SEALAgent
-from model.metrics import CSVLogger, feature_rank
+from model.metrics import CSVLogger, policy_entropy
 
-CSV_COLUMNS = ["step", "episode", "return", "td_err", "v",
-               "event_flops", "dense_flops", "event_rate_mean",
-               "dormant_frac", "feat_rank", "alpha_eff", "theta_mean", "corrVr"]
+CSV_COLUMNS = ["step", "episode", "return", "td_err", "v", "spike_rate_hz",
+               "policy_entropy", "b_drift", "tag_norm_win", "tag_norm_wrec",
+               "dormant_frac", "max_episode_len"]
 
 
 def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
-        ckpt_every: int, debug: bool):
+        ckpt_every_ep: int, ckpt_keep: int, quiet: bool, log_every_ep: int):
     torch.manual_seed(seed); np.random.seed(seed)
-    env, spec = make_env(cfg.env_id, seed=seed, frame_stack=cfg.frame_stack,
-                         render=gui)
+    env, spec = make_env(cfg.env_id, seed=seed, render=gui)
     agent = SEALAgent(cfg, n_actions=spec.n_actions, device="cpu")
-    agent.encoder.record_acts = True
-    warmup(env, agent, n_frames=1000, seed=seed)
-    agent.encoder.record_acts = True
-    agent.reset_episode()
+    warmup(env, agent, n_frames=cfg.warmup_frames, seed=seed)
+    agent.reset_after_warmup()
 
     # ---- checkpoint paths ----
     ckpt_dir = cfg.out_dir
     os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_latest = os.path.join(ckpt_dir, "seal-pong_latest.pt")
     ckpt_best = os.path.join(ckpt_dir, "seal-pong_best.pt")
     best_ret20 = -1e9
+
+    def _ep_num_of(name: str):
+        m = re.match(r"^seal-(\d+)\.pt$", name)
+        return int(m.group(1)) if m else None
+
+    ckpt_ring = collections.deque(maxlen=ckpt_keep)
+    if os.path.isdir(ckpt_dir):
+        existing = []
+        for f in os.listdir(ckpt_dir):
+            n = _ep_num_of(f)
+            if n is not None:
+                existing.append((n, os.path.join(ckpt_dir, f)))
+        for _n, path in sorted(existing)[:ckpt_keep]:
+            ckpt_ring.append(path)
 
     # ---- live stats ----
     ep_returns = []
     raw_ep_returns = []
-    v_at_ep = []
     recent_ret = collections.deque(maxlen=20)
-    recent_v = collections.deque(maxlen=20)
     ep_ret = 0.0
     raw_ep_ret = 0.0
     corrVr = 0.0
+    v_at_ep = []
+    recent_v = collections.deque(maxlen=20)
+    # ---- early critic-convergence probe (works from episode 1) ----
+    # End-of-episode V should approach the terminal reward r_term, since the
+    # TD target at the terminal step is r + γ·0 = r. A correct run drives
+    # |mean_term_v − mean_term_r| → 0; a broken value channel leaves it stuck.
+    # This catches critic-channel bugs in ~100 eps instead of ~1.5M frames.
+    recent_term_v = collections.deque(maxlen=100)
+    recent_term_r = collections.deque(maxlen=100)
+    term_v_mean = 0.0
+    term_r_mean = 0.0
 
     logger = CSVLogger(os.path.join(cfg.out_dir, f"{cfg.run_name}.csv"), CSV_COLUMNS)
 
     # ----------------------------------------------------------------- ckpt
-    def save_checkpoint(tag="latest"):
-        path = ckpt_latest if tag == "latest" else ckpt_best
+    def _ckpt_payload():
         norm = find_norm_stats(env)
-        torch.save({
+        return {
             "step": t, "n_episodes": len(ep_returns),
             "model_state": agent.state_dict(),
-            "opt_traces": [tr.detach().clone() for tr in agent.opt.traces],
-            "opt_v": [vi.detach().clone() for vi in agent.opt._v],
-            "opt_counter": agent.opt.counter,
-            "opt_z_sum": agent.opt.last_z_sum,
-            "opt_step_size": agent.opt.last_step_size,
-            "target_enc": agent.target_enc.state_dict(),
-            "since_active": agent.since_active.copy(),
             "global_step": agent.global_step,
             "norm_mean": None if norm is None else np.array(norm.mean, dtype=np.float64),
             "norm_var": None if norm is None else np.array(norm.var, dtype=np.float64),
@@ -84,8 +101,21 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
             "corrVr": corrVr,
             "best_ret20": best_ret20,
             "env_id": cfg.env_id,
-        }, path)
+        }
+
+    def save_ring_checkpoint():
+        path = os.path.join(ckpt_dir, f"seal-{len(ep_returns)}.pt")
+        if len(ckpt_ring) == ckpt_ring.maxlen:
+            old = ckpt_ring.popleft()
+            try: os.remove(old)
+            except FileNotFoundError: pass
+        torch.save(_ckpt_payload(), path)
+        ckpt_ring.append(path)
         return path
+
+    def save_best_checkpoint():
+        torch.save(_ckpt_payload(), ckpt_best)
+        return ckpt_best
 
     def load_checkpoint(path):
         nonlocal best_ret20, corrVr, ep_ret
@@ -96,19 +126,7 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
             {k: v for k, v in sd.items()
              if k in model_sd and v.shape == model_sd[k].shape},
             strict=False)
-        for i, tr in enumerate(ck["opt_traces"]):
-            if i < len(agent.opt.traces):
-                agent.opt.traces[i].copy_(tr)
-        for i, vi in enumerate(ck["opt_v"]):
-            if i < len(agent.opt._v):
-                agent.opt._v[i].copy_(vi)
-        agent.opt.counter = int(ck.get("opt_counter", 0))
-        agent.opt.last_z_sum = ck.get("opt_z_sum", 0.0)
-        agent.opt.last_step_size = ck.get("opt_step_size", 0.0)
-        if "target_enc" in ck:
-            agent.target_enc.load_state_dict(ck["target_enc"])
-        agent.since_active[:] = ck["since_active"]
-        agent.global_step = int(ck["global_step"])
+        agent.global_step = int(ck.get("global_step", 0))
         restore_norm_stats(env, ck.get("norm_mean"), ck.get("norm_var"),
                            ck.get("norm_count", 0))
         ep_returns.clear(); ep_returns.extend(ck["ep_returns"])
@@ -131,7 +149,7 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
         game_w, game_h = 160 * scale, 210 * scale
         panel_w = 340
         screen = pygame.display.set_mode((game_w + panel_w, game_h))
-        pygame.display.set_caption(f"SEAL training  (seed={seed})")
+        pygame.display.set_caption(f"SEAL e-prop training  (seed={seed})")
         font = pygame.font.SysFont("monospace", 16)
         font_sm = pygame.font.SysFont("monospace", 13)
 
@@ -150,6 +168,13 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
     last_frame_time = time.time()
     frame_period = 1.0 / fps_cap if fps_cap else 0.0
 
+    # ---- terminal progress bar (silent if --quiet or --gui) ----
+    show_bar = (not quiet) and (not gui)
+    pbar = tqdm(total=cfg.total_frames, initial=t, unit="fr",
+                desc="SEAL e-prop", disable=not show_bar,
+                dynamic_ncols=True, mininterval=0.5, miniters=50,
+                smoothing=0.1)
+
     try:
         while t < cfg.total_frames:
             if gui:
@@ -163,36 +188,67 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
             raw_ep_ret += float(info.get("raw_reward", r))
 
             if done:
-                td_err = agent.learn(pending, float(r), next_pending=None, done=True)
+                td_err = agent.learn(pending, float(r), next_state=None, done=True)
                 ep_returns.append(ep_ret)
                 raw_ep_returns.append(raw_ep_ret)
                 v_at_ep.append(agent.last_v)
                 recent_ret.append(ep_ret); recent_v.append(agent.last_v)
+                # terminal-V convergence probe: V at the penultimate state
+                # should predict the terminal reward r.
+                recent_term_v.append(agent.last_v)
+                recent_term_r.append(float(r))
+                if recent_term_v:
+                    term_v_mean = float(np.mean(recent_term_v))
+                    term_r_mean = float(np.mean(recent_term_r))
                 if len(ep_returns) >= 5 and len(v_at_ep) == len(ep_returns):
                     arr_r = np.array(ep_returns[-50:])
                     arr_v = np.array(v_at_ep[-50:])
-                    if arr_r.std() > 1e-9 and arr_v.std() > 1e-9:
+                    # Only trust corrVr when returns actually SPREAD — with
+                    # near-constant returns (std ~0.2 in the all-losing regime)
+                    # corrVr is just noise on a 1-bit signal. Guard at 1.0.
+                    if arr_r.std() > 1.0 and arr_v.std() > 1e-9:
                         corrVr = float(np.corrcoef(arr_v, arr_r)[0, 1])
-                _log_episode(t, len(ep_returns), raw_ep_ret, corrVr, agent, debug)
+                _log_episode(t, len(ep_returns), raw_ep_ret, corrVr, agent,
+                             quiet or gui, log_every_ep, pbar,
+                             term_v_mean, term_r_mean)
                 _maybe_log(logger, t, len(ep_returns), raw_ep_ret, td_err,
                            agent, cfg, corrVr)
+                if len(ep_returns) % ckpt_every_ep == 0:
+                    save_ring_checkpoint()
+                    cur_ret20 = float(np.mean(recent_ret)) if recent_ret else -1e9
+                    if cur_ret20 > best_ret20:
+                        best_ret20 = cur_ret20
+                        save_best_checkpoint()
+                    print(f"[ckpt] saved ep{len(ep_returns)} "
+                          f"(ring={len(ckpt_ring)}/{ckpt_ring.maxlen}) "
+                          f"best_ret20={best_ret20:.2f}", flush=True)
                 agent.reset_episode()
                 obs, _ = env.reset()
                 a, pending = agent.act(obs)
                 ep_ret = 0.0; raw_ep_ret = 0.0
             else:
-                a_next, next_pending = agent.act(next_obs)
+                a_next, next_state = agent.act(next_obs)
                 td_err = agent.learn(pending, float(r),
-                                     next_pending=next_pending, done=False)
-                pending = next_pending; a = a_next
+                                     next_state=next_state, done=False)
+                pending = next_state; a = a_next
                 if t - last_log >= cfg.log_every:
                     _maybe_log(logger, t, len(ep_returns), raw_ep_ret, td_err,
                                agent, cfg, corrVr, running=True)
                     last_log = t
 
             t += 1
+            pbar.update(1)
+            # refresh the bar's postfix with live "is it learning?" signals
+            if show_bar and (t - last_log >= cfg.log_every or done):
+                mean20 = float(np.mean(recent_ret)) if recent_ret else 0.0
+                pbar.set_postfix({
+                    "ep": len(ep_returns),
+                    "ret20": f"{mean20:+.1f}",
+                    "corrVr": f"{corrVr:+.2f}",
+                    "Hz": f"{agent.last_spike_rate_hz:.0f}",
+                }, refresh=True)
+                last_log = t
 
-            # ---- render ----
             if gui and screen is not None:
                 _render_gui(screen, font, font_sm, env, agent, t,
                             cfg.total_frames, len(ep_returns), corrVr,
@@ -203,26 +259,19 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
                         time.sleep(frame_period - dt)
                     last_frame_time = time.time()
 
-            # ---- checkpoint ----
-            if t % ckpt_every == 0:
-                save_checkpoint("latest")
-                cur_ret20 = float(np.mean(recent_ret)) if recent_ret else -1e9
-                if cur_ret20 > best_ret20:
-                    best_ret20 = cur_ret20
-                    save_checkpoint("best")
-                print(f"[ckpt] saved @{t} best_ret20={best_ret20:.2f}", flush=True)
-
     except KeyboardInterrupt:
+        pbar.close()
         print(f"\nInterrupted at frame {t}.", flush=True)
-        save_checkpoint("latest")
+        save_ring_checkpoint()
         print(f"[ckpt] final save on interrupt.", flush=True)
     finally:
         env.close()
         if gui and screen is not None:
             import pygame; pygame.quit()
 
+    pbar.close()
     if t >= cfg.total_frames:
-        save_checkpoint("latest")
+        save_ring_checkpoint()
         print(f"[ckpt] final save on completion.", flush=True)
     print(f"\nDone. episodes={len(ep_returns)} "
           f"mean_return(last20)={(float(np.mean(recent_ret)) if recent_ret else 0.0):.2f} "
@@ -230,54 +279,67 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
 
 
 # ----------------------------------------------------------------- helpers
-def _theta_mean(threshold) -> float:
-    th = threshold.theta
-    if isinstance(th, torch.Tensor):
-        return round(float(th.mean().item()), 6)
-    return round(float(th), 6)
-
-
 def _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg, corrVr,
                running=False):
-    rates = agent.encoder.event_rates()
-    rate_mean = float(np.mean(rates)) if rates else 0.0
-    frac = float(np.mean([bool(u.item() > cfg.utility_tau_low)
-                          for u in agent.utility.utility]))
-    dormant = float((agent.since_active > cfg.dormant_silence_steps).mean())
-    h_np = np.array(agent.encoder.last_acts[-1] if agent.encoder.last_acts else [0.0])
-    z = getattr(agent.opt, "last_z_sum", 0.0)
-    a_eff = getattr(agent.opt, "last_step_size", 0.0) * abs(td_err) / max(z, 1e-12)
+    tags = agent.tag_norms()
     logger.log({
         "step": t, "episode": ep_idx,
         "return": round(ep_return, 3) if not running else "",
         "td_err": round(td_err, 5),
         "v": round(float(agent.last_v), 4),
-        "event_flops": agent.event_flops(),
-        "dense_flops": agent.dense_flops(),
-        "event_rate_mean": round(rate_mean, 5),
-        "dormant_frac": round(dormant, 4),
-        "feat_rank": feature_rank(h_np),
-        "alpha_eff": round(a_eff, 8),
-        "theta_mean": _theta_mean(agent.encoder.event_layers[0].threshold),
-        "corrVr": round(corrVr, 4),
+        "spike_rate_hz": round(agent.last_spike_rate_hz, 2),
+        "policy_entropy": round(agent.last_entropy, 4),
+        "b_drift": round(agent.b_drift(), 5),
+        "tag_norm_win": round(tags[0], 4) if tags else 0.0,
+        "tag_norm_wrec": round(tags[1], 4) if len(tags) > 1 else 0.0,
+        "dormant_frac": round(agent.dormant_frac(), 4),
+        "max_episode_len": agent._current_max_len(),
     })
 
 
-def _log_episode(t, n_eps, raw_ep_ret, corrVr, agent, debug):
-    if not debug:
+def _log_episode(t, n_eps, raw_ep_ret, corrVr, agent, silent, log_every_ep,
+                 pbar, term_v_mean=0.0, term_r_mean=0.0):
+    """Print one line per completed episode (throttled to every log_every_ep).
+
+    Diagnostics:
+      corrVr     — Pearson corr of V vs return over last 50 eps. Only
+                   meaningful once returns SPREAD (std > 1.0); otherwise it
+                   stays 0.0 and the early-stage probe below carries the load.
+      termV/termR — rolling (100-ep) mean of end-of-episode V and terminal
+                    reward. A correct critic drives termV → termR. A wide,
+                    persistent gap signals a broken value channel (the bug
+                    that stalled the previous run for ~1.5M frames).
+    """
+    if silent or log_every_ep <= 0:
         return
+    if n_eps % log_every_ep != 0:
+        return
+    v_gap = term_v_mean - term_r_mean
     flag = ""
-    if corrVr > 0.15:
+    # ---- early-stage probe (works from episode 1) ----
+    # End-of-episode V should approach the terminal reward. After a short
+    # warmup of the rolling window, a persistent wide gap is the fingerprint
+    # of a broken critic channel — flag it loudly so it's caught in minutes.
+    if n_eps > 100 and abs(v_gap) > 1.0:
+        flag = (f"  ⚠ termV off-target (gap={v_gap:+.2f}; "
+                f"critic not converging — check value channel)")
+    # ---- late-stage probe (only meaningful once returns spread) ----
+    elif corrVr > 0.15:
         flag = "  V-tracking (promising)"
-    elif corrVr < 0.05 and n_eps > 50:
+    elif corrVr < -0.30:
+        flag = "  ⚠ corrVr anti-correlated (sign/value-channel bug?)"
+    elif corrVr < 0.05 and n_eps > 50 and corrVr != 0.0:
         flag = "  corrVr flat (not learning; stop if persists)"
-    mode = "greedy" if agent.epsilon < 0.05 else ""
-    print(f"[EP {n_eps:4d}] f={t:6d} pong={raw_ep_ret:+3.0f} "
-          f"ε={agent.epsilon:.3f} corrVr={corrVr:+.3f} "
-          f"|d|={abs(agent.last_td_err):.3f} "
-          f"V={agent.last_v:+.2f} z={getattr(agent.opt,'last_z_sum',0):.0f}{flag}"
-          + (f"  ← POLICY MODE" if mode else ""),
-          flush=True)
+    line = (f"[EP {n_eps:4d}] f={t:7d} pong={raw_ep_ret:+3.0f} "
+            f"corrVr={corrVr:+.3f} δ={agent.last_td_err:+.3f} "
+            f"V={agent.last_v:+.2f} Hz={agent.last_spike_rate_hz:.1f} "
+            f"ent={agent.last_entropy:.2f} Bdrift={agent.b_drift():.4f} "
+            f"termV={term_v_mean:+.2f} termR={term_r_mean:+.2f}{flag}")
+    # tqdm.write prints above the bar without corrupting it
+    try:
+        pbar.write(line)
+    except Exception:
+        print(line, flush=True)
 
 
 def _render_gui(screen, font, font_sm, env, agent, t, total_frames,
@@ -291,14 +353,10 @@ def _render_gui(screen, font, font_sm, env, agent, t, total_frames,
     screen.blit(surf, (0, 0))
     screen.fill((20, 20, 25), (game_w, 0, panel_w, game_h))
     run_ret = float(np.mean(recent_ret)) if recent_ret else 0.0
-    a_eff = getattr(agent.opt, "last_step_size", 0) * abs(agent.last_td_err) / \
-            max(getattr(agent.opt, "last_z_sum", 1), 1)
-    ef = agent.event_flops(); df = agent.dense_flops()
-    flop_ratio = (df / ef) if ef > 0 else 0.0
     corr_color = (80, 255, 120) if corrVr > 0.15 else \
-                 (255, 120, 120) if corrVr < 0.05 else (255, 220, 80)
+                 (255, 120, 120) if corrVr < -0.30 else (255, 220, 80)
     lines = [
-        (f"SEAL  (streaming + event-driven)", (220, 220, 220), font),
+        (f"SEAL  (e-prop LSNN, adaptive)", (220, 220, 220), font),
         (f"", (0, 0, 0), font_sm),
         (f"frame   {t}/{total_frames}  ({100*t/total_frames:.1f}%)", (200, 200, 200), font),
         (f"episode {n_eps}", (200, 200, 200), font),
@@ -307,14 +365,14 @@ def _render_gui(screen, font, font_sm, env, agent, t, total_frames,
         (f"--- IS IT LEARNING? ---", (255, 220, 80), font),
         (f"corrVr  {corrVr:+.3f}   <- want rising", corr_color, font),
         (f"return  {run_ret:+.2f}  (last20 ep)", (200, 200, 200), font),
-        (f"FLOPs   {flop_ratio:.1f}x savings", (160, 200, 160), font_sm),
         (f"", (0, 0, 0), font_sm),
         (f"--- health ---", (180, 180, 200), font_sm),
-        (f"|delta| {abs(agent.last_td_err):.3f}", (170, 170, 170), font_sm),
+        (f"delta   {agent.last_td_err:+.3f}", (170, 170, 170), font_sm),
         (f"V       {agent.last_v:+.2f}", (170, 170, 170), font_sm),
-        (f"z_sum   {getattr(agent.opt,'last_z_sum',0):.0f}", (170, 170, 170), font_sm),
-        (f"a_eff   {a_eff:.1e}", (170, 170, 170), font_sm),
-        (f"eps     {agent.epsilon:.3f}", (170, 170, 170), font_sm),
+        (f"spike   {agent.last_spike_rate_hz:.1f} Hz", (170, 170, 170), font_sm),
+        (f"entropy {agent.last_entropy:.3f}", (170, 170, 170), font_sm),
+        (f"B=symmetric (Wout\u1d40)", (170, 170, 170), font_sm),
+        (f"dormant {agent.dormant_frac():.2f}", (170, 170, 170), font_sm),
     ]
     y = 8
     for txt, col, fnt in lines:
@@ -325,20 +383,26 @@ def _render_gui(screen, font, font_sm, env, agent, t, total_frames,
 
 
 def main():
-    p = argparse.ArgumentParser(description="SEAL training (streaming, event-driven)")
+    p = argparse.ArgumentParser(description="SEAL training (e-prop LSNN)")
     p.add_argument("--frames", type=int, default=10_000_000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--env", default="ALE/Pong-v5")
-    p.add_argument("--gui", action="store_true", help="live Pygame window")
+    p.add_argument("--gui", action="store_true", help="live Pygame window (disables terminal bar)")
     p.add_argument("--fps", type=int, default=0, help="cap display fps (0 = uncapped)")
-    p.add_argument("--debug", action="store_true", help="per-episode console log")
+    p.add_argument("--quiet", action="store_true", help="suppress terminal logging (CSV still written)")
+    p.add_argument("--log-every-ep", type=int, default=1,
+                   help="print an episode line every N episodes (default 1; use 5-10 for long runs)")
     p.add_argument("--resume", type=str, default="", help="checkpoint path to resume from")
-    p.add_argument("--ckpt-every", type=int, default=50_000, help="checkpoint interval (frames)")
+    p.add_argument("--ckpt-every-ep", type=int, default=50,
+                   help="checkpoint every N episodes (rotating ring)")
+    p.add_argument("--ckpt-keep", type=int, default=5,
+                   help="rotating checkpoints to keep (ring buffer)")
     args = p.parse_args()
     cfg = config_from_preset(args.env, total_frames=args.frames,
-                             run_name=f"seal_s{args.seed}")
+                             run_name=f"seal_eprop_s{args.seed}")
     run(cfg, seed=args.seed, gui=args.gui, fps_cap=args.fps,
-        resume_path=args.resume, ckpt_every=args.ckpt_every, debug=args.debug)
+        resume_path=args.resume, ckpt_every_ep=args.ckpt_every_ep,
+        ckpt_keep=args.ckpt_keep, quiet=args.quiet, log_every_ep=args.log_every_ep)
 
 
 if __name__ == "__main__":

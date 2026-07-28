@@ -1,389 +1,291 @@
-"""SEAL agent — Stream Q with event-driven encoder + SPR auxiliary loss.
+"""SEAL agent: spiking CNN -> LSNN -> actor/critic, trained by reward-based e-prop.
 
-Architecture:
-  4 stacked frames [1, 4, 84, 84]  (velocity is in the input, no RNN)
-    -> EventConv2d(4->32,  8, s5) -> LeakyReLU + LayerNorm
-    -> EventConv2d(32->64, 4, s3) -> LeakyReLU + LayerNorm
-    -> EventConv2d(64->64, 3, s2) -> LeakyReLU + LayerNorm
-    -> flatten -> EventLinear(256) -> LeakyReLU + LayerNorm
-    -> LayerNorm(256, affine-free) -> z
-    -> Q head: Linear(256, n_actions)   (argmax = greedy action)
+SEAL = Streaming Event-driven Adaptive Learner. The architecture is a recurrent
+network of spiking neurons (LSNN = LIF + ALIF) trained online by adaptive
+reward-based e-prop (Bellec et al., Nature Communications 2020, Eq. 5/36/37).
+No BPTT, no replay, no frame stacking.
 
-Auxiliary (SPR, arXiv:2602.09396):
-  A transition model predicts z_{t+1..t+K} from z_t + actions. A momentum
-  (EMA) target encoder produces stop-gradient target latents. The SPR loss
-  (negative cosine similarity) shapes the encoder to be predictive of its own
-  future. The SPR gradient is orthogonalized against the Q gradient (so it
-  only shapes the encoder in non-conflicting directions) and norm-bounded
-  (so it can't destabilize the trunk).
+One env step:
+  1. encode frame -> input spikes (spiking CNN)
+  2. run LSNN `sim_ms_per_step` ms -> spike rate, eligibility traces updated
+  3. readout -> actor logits + critic V
+  4. sample action from softmax policy
+  5. (next step) compute δ = r + γV' - V, learning signal L_j, accumulate tags
+  6. e-prop update on Win/Wrec; autograd SGD update on readout
+  7. discard the sample
 
-Stream Q (off-policy): δ = r + γ·max_a'Q(s',a') - Q(s,a). ε-greedy.
-Traces reset on exploration actions (off-policy correction).
-
-Optimizer:
-  * Encoder + Q head — AdaptiveObGD (κ-bound + 2nd-moment normalization).
-  * SPR (transition + projection) — SGD with orthogonal projection vs Q.
+Eligibility traces carry temporal credit forward; the neuron-specific learning
+signal L_j (via symmetric feedback B_jk = Wout_kjᵀ) routes output errors to each
+neuron; the reward prediction error δ gates the update.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from config import Config
-from model.event_layers import EventConv2d, EventLinear
-from model.thresholds import PerPixelThreshold
-from model.optimizers import AdaptiveObGD
-from model.target_encoder import TargetEncoder
-from model.spr import TransitionModel, ProjectionHead, spr_loss
+from model.spiking_conv import SpikingCNN
+from model.lsnn import LSNNCore
+from model.readout import LeakyReadout
+from model.broadcast import FeedbackWeights
+from model.eprop_optimizer import EpropOptimizer
+from model.optim import ObGD
 from model.utility import UtilityTracker
-from model.metrics import flops_event_layers, dense_flops_conv
-from model.sparse_init import apply_sparse_init
-
-
-def _leaky(x):
-    return F.leaky_relu(x)
-
-
-class EventEncoder(nn.Module):
-    """Event-driven conv trunk + EventLinear -> 256-dim features."""
-
-    def __init__(self, cfg: Config):
-        super().__init__()
-        self.cfg = cfg
-        self.event_layers = nn.ModuleList()
-        in_ch = cfg.conv_layers[0][0]
-        H = W = 84
-        prev_ch = in_ch
-        for (ic, oc, k, st) in cfg.conv_layers:
-            th = PerPixelThreshold(k=cfg.perpixel_k,
-                                   warmup_steps=cfg.perpixel_warmup,
-                                   floor=cfg.perpixel_floor)
-            self.event_layers.append(EventConv2d(ic, oc, k, st, th))
-            prev_ch = oc
-            H = (H - k) // st + 1
-            W = (W - k) // st + 1
-        self.flat_dim = prev_ch * H * W
-        self.th_lin = PerPixelThreshold(k=cfg.perpixel_k,
-                                        warmup_steps=cfg.perpixel_warmup,
-                                        floor=cfg.perpixel_floor)
-        self.fc = EventLinear(self.flat_dim, cfg.trunk_dim, self.th_lin)
-        self.event_layers.append(self.fc)
-        self._flat_dim = self.flat_dim
-        self._conv_cfg = cfg.conv_layers
-        self.record_acts = False
-        self.last_acts = []
-
-    def _ln(self, x):
-        return F.layer_norm(x, x.shape[-1:] if x.dim() == 2 else x.shape[1:])
-
-    def forward(self, x):
-        h = x
-        acts = []
-        for layer in list(self.event_layers)[:-1]:
-            z = layer(h)
-            h = _leaky(self._ln(z))
-            if self.record_acts:
-                acts.append(float(h.detach().abs().mean().item()))
-        h = h.flatten(1)
-        z = self.fc(h)
-        feats = _leaky(self._ln(z))
-        if self.record_acts:
-            acts.append(float(feats.detach().abs().mean().item()))
-        self.last_acts = acts
-        return feats
-
-    def reset_cache(self):
-        for layer in self.event_layers:
-            layer.reset_cache()
-
-    def event_rates(self):
-        return [l.last_event_rate for l in self.event_layers]
-
-    def first_conv_mask(self):
-        return self.event_layers[0].last_mask
-
-    def flops(self):
-        return flops_event_layers(self.event_layers)
-
-    def dense_flops(self):
-        H = W = 84
-        total = 0
-        for (ic, oc, k, st) in self._conv_cfg:
-            total += dense_flops_conv(ic, oc, k, st, H, W)
-            H = (H - k) // st + 1
-            W = (W - k) // st + 1
-        total += self._flat_dim * self.cfg.trunk_dim * 2
-        return total
-
-
-class Heads(nn.Module):
-    """Q head only. LayerNorm is affine-free → Q is a pure linear learner."""
-
-    def __init__(self, cfg: Config, n_actions: int):
-        super().__init__()
-        self.ln = nn.LayerNorm(cfg.trunk_dim, elementwise_affine=False)
-        self.q = nn.Linear(cfg.trunk_dim, n_actions)
-
-    def forward(self, h):
-        z = self.ln(h)
-        logits = self.q(z)
-        return logits, z
 
 
 @dataclass
-class Transition:
-    """Outputs from one forward pass, held for the TD update + SPR delay queue."""
-    logits: torch.Tensor
+class StepState:
+    """Outputs from one forward pass, held for the TD update."""
+    logits: torch.Tensor       # [n_actor]
+    value: torch.Tensor        # scalar
     action: int
-    feats: torch.Tensor         # trunk features [1, 256] (in-graph for SPR loss)
-    head_features: torch.Tensor # LayerNormed z [1, 256] (SPR's latent input)
-    obs: torch.Tensor           # raw input [1, 4, 84, 84] (for target encoder)
+    log_prob: torch.Tensor     # scalar (for entropy)
+    z_rate: torch.Tensor       # LSNN spike rate [n_total] (readout input)
+    frame: torch.Tensor = None  # [1,1,84,84] input frame (for the CNN grad path)
     is_exploration: bool = False
 
 
 class SEALAgent(nn.Module):
-    """SEAL: event-driven encoder + Stream Q (AdaptiveObGD) + SPR (orthogonal SGD)."""
+    """SEAL: adaptive reward-based e-prop on an LSNN, actor-critic, ALE Pong."""
 
     def __init__(self, cfg: Config, n_actions: int, device: str = "cpu"):
         super().__init__()
         self.cfg = cfg
         self.n_actions = n_actions
         self.device = device
-        self.encoder = EventEncoder(cfg)
-        self.heads = Heads(cfg, n_actions)
-        self.spr_transition = TransitionModel(cfg.trunk_dim, n_actions)
-        self.spr_projection = ProjectionHead(cfg.trunk_dim, cfg.spr_proj_dim)
-        apply_sparse_init(self, sparsity=0.9)
 
-        # ---- parameter split: encoder+Q on ObGD, SPR on SGD ----
-        spr_param_ids = set(id(p) for p in self.spr_transition.parameters()) | \
-                        set(id(p) for p in self.spr_projection.parameters())
-        self.obgd_params = [p for p in self.parameters()
-                            if p.requires_grad and id(p) not in spr_param_ids]
-        self.spr_params = [p for p in self.parameters()
-                           if p.requires_grad and id(p) in spr_param_ids]
-        self.params = self.obgd_params
+        # ---- front-end + recurrent core ----
+        self.cnn = SpikingCNN(cfg.conv_layers, target_rate=cfg.input_spike_rate,
+                              gain=0.15, max_p=0.3, seed=cfg.seed,
+                              trainable=cfg.train_cnn)
+        self.core = LSNNCore(cfg, n_input_neurons=self.cnn.n_input_neurons)
 
-        self.opt = AdaptiveObGD(self.obgd_params, alpha=cfg.alpha,
-                                kappa=cfg.kappa, lam=cfg.lam, gamma=cfg.gamma,
-                                beta2=cfg.beta2, eps=cfg.eps)
-        self.utility = UtilityTracker(self.obgd_params, decay=cfg.utility_decay,
-                                      tau_low=cfg.utility_tau_low,
-                                      n_trunk_units=cfg.trunk_dim)
+        # ---- readout (actor + critic) ----
+        self.readout = LeakyReadout(cfg.n_lif + cfg.n_alif, n_actions,
+                                    n_critic=1, kappa=cfg.kappa)
 
-        # ---- SPR target encoder (EMA copy, no gradients) ----
-        self.target_enc = TargetEncoder(self.encoder, tau=cfg.spr_tau)
+        # ---- symmetric e-prop feedback weights (B^π = Wout_actor^T, B^V = Wout_critic^T) ----
+        # B is NOT a separate parameter; it is read live from the readout's
+        # separate actor/critic weights at each learning_signal() call, so it
+        # always tracks the current readout. Separate channels (paper Eq. 37)
+        # give the critic its own undiluted feedback path into the LSNN.
+        self.feedback = FeedbackWeights(
+            n_total=cfg.n_lif + cfg.n_alif, n_actor=n_actions, n_critic=1,
+            readout=self.readout)
 
-        # ---- SPR delay queue: hold K transitions to compute the loss K steps later ----
-        self.spr_queue = deque(maxlen=cfg.spr_horizon)
+        # ---- optimizers ----
+        # Win + Wrec on e-prop with an ObGD-bounded step (Eq. 36 direction,
+        # overshooting-bounded size — model/eprop_optimizer.py).
+        self.eprop_opt = EpropOptimizer(
+            [self.core.Win, self.core.Wrec],
+            eta=cfg.eta_rec, gamma=cfg.gamma, lam=cfg.lam_rec,
+            kappa=cfg.kappa_rec, grad_clip=cfg.grad_clip,
+            length_scale=cfg.eta_length_scale)
+        # Readout + CNN on autograd ObGD (stream-x): ONE optimizer, per-group
+        # lr/κ. Separate actor/critic groups (κ_policy=3, κ_value=2 per the
+        # paper); the CNN gets its own group. ObGD maintains per-parameter
+        # γλ eligibility traces and multiplies by δ itself, so the losses in
+        # learn() must be δ-free (see model/optim.py docstring).
+        self.stream_opt = ObGD(
+            [{"params": [self.readout.Wout_actor, self.readout.b_actor],
+              "lr": cfg.eta_out, "kappa": cfg.kappa_policy,
+              "weight_decay": cfg.wd_policy},
+             {"params": [self.readout.Wout_critic, self.readout.b_critic],
+              "lr": cfg.eta_out, "kappa": cfg.kappa_value,
+              "weight_decay": cfg.wd_value},
+             {"params": list(self.cnn.parameters()),
+              "lr": cfg.eta_cnn, "kappa": cfg.kappa_cnn,
+              "weight_decay": cfg.wd_cnn}],
+            gamma=cfg.gamma, lamda=cfg.lam)
 
-        self.since_active = np.zeros(cfg.trunk_dim, dtype=np.int64)
+        # ---- plasticity ----
+        self.utility = UtilityTracker(
+            n_total=cfg.n_lif + cfg.n_alif, regen_every=cfg.regen_every,
+            dormant_silence_ms=cfg.dormant_silence_ms, regen_frac=cfg.regen_frac,
+            win_scale=cfg.win_scale, wrec_scale=cfg.wrec_scale)
+
         self.global_step = 0
-        self.epsilon = float(cfg.epsilon_start)
+        self.last_td_err = 0.0
+        self.last_v = 0.0
+        self.last_entropy = 0.0
+        self.last_spike_rate_hz = 0.0
 
-    def _update_epsilon(self):
-        cfg = self.cfg
-        duration = max(1, int(cfg.exploration_fraction * cfg.total_frames))
-        slope = (cfg.epsilon_end - cfg.epsilon_start) / duration
-        self.epsilon = max(slope * self.global_step + cfg.epsilon_start, cfg.epsilon_end)
-
-    # ------------------------------------------------------------------ state
+    # ----------------------------------------------------------- episode ctl
     def reset_episode(self):
-        self.encoder.reset_cache()
-        self.opt.reset()
-        self.spr_queue.clear()
+        self.core.reset()
+        self.readout.reset()
+        self.eprop_opt.reset()
 
     def warmup_forward(self, obs):
-        x = self._to_obs(obs)
-        _ = self.encoder(x)
+        """Run a forward pass without learning (normalize stats warmup)."""
+        with torch.no_grad():
+            x = self._to_frame(obs)
+            in_spikes = self.cnn(x)
+            _ = self.core(in_spikes)
+            _ = self.readout(self.core.spike_count / float(self.cfg.sim_ms_per_step))
 
     def reset_after_warmup(self):
         self.reset_episode()
-        self.since_active[:] = 0
         self.global_step = 0
 
-    def _to_obs(self, obs):
+    def _to_frame(self, obs) -> torch.Tensor:
+        from env.envs import obs_to_chw
         if not isinstance(obs, torch.Tensor):
-            obs = torch.from_numpy(np.asarray(obs, dtype=np.float32))
-        if obs.dim() == 3 and obs.shape[0] == obs.shape[1] \
-                and obs.shape[-1] <= obs.shape[0] and obs.shape[-1] != obs.shape[0]:
-            obs = obs.permute(2, 0, 1)
-        if obs.dim() == 2:
-            obs = obs.unsqueeze(0).unsqueeze(0)
-        elif obs.dim() == 3:
-            obs = obs.unsqueeze(0)
-        return obs.contiguous().float().to(self.device)
+            obs = torch.from_numpy(obs_to_chw(obs))
+        return obs.unsqueeze(0).contiguous().float().to(self.device)  # [1,1,84,84]
 
-    # ----------------------------------------------------------- forward/act
+    # ----------------------------------------------------------- episode len
+    def _current_max_len(self) -> int:
+        """From the episode-length schedule, the current max episode length."""
+        sched = self.cfg.episode_schedule
+        cur = sched[0][1]
+        for (start_step, max_len) in sched:
+            if self.global_step >= start_step:
+                cur = max_len
+        return cur
+
+    # ----------------------------------------------------------- act
     def act(self, obs) -> tuple:
-        x = self._to_obs(obs)
-        feats = self.encoder(x)
-        logits, z = self.heads(feats)
-        is_expl = False
-        if np.random.rand() < self.epsilon:
-            a = int(np.random.randint(0, self.n_actions))
-            is_expl = True
+        """Forward pass + action sampling. Returns (action, StepState)."""
+        x = self._to_frame(obs)
+        in_spikes = self.cnn(x)
+        z_rate = self.core(in_spikes)          # [n_total], drives eligibility
+        logits, value = self.readout(z_rate)
+        probs = F.softmax(logits, dim=-1)
+        # ε-greedy on top of the softmax policy (stream-x's Atari recipe):
+        # exploration is DECOUPLED from policy sharpness, so a sharpening
+        # softmax can never kill exploration. The PG update still treats the
+        # taken action as on-policy (at ε=0.05 the bias is negligible).
+        is_expl = bool(np.random.rand() < self.cfg.explore_eps)
+        if is_expl:
+            a = int(np.random.randint(self.n_actions))
         else:
-            a = int(logits.detach().argmax().item())
-        with torch.no_grad():
-            f_np = feats.detach().squeeze(0).cpu().numpy()
-            self.utility.update_unit_utility(f_np)
-            active = (np.abs(f_np) > 1e-3)
-            self.since_active[active] = 0
-            self.since_active[~active] += 1
-        tr = Transition(logits=logits, action=a, feats=feats,
-                        head_features=z, obs=x, is_exploration=is_expl)
-        return a, tr
+            a = int(torch.multinomial(probs, 1).item())  # stochastic policy
+        log_prob = torch.log(probs[a] + 1e-12)
+        # track spiking activity for plasticity
+        self.utility.observe(self.core.last_z, self.cfg.sim_ms_per_step)
+        self.last_spike_rate_hz = self.core.spike_rate()
+        self.last_entropy = float(-(probs * torch.log(probs + 1e-12)).sum().item())
+        self.last_v = float(value.item())
+        # NOTE: z_rate is detached; the readout graph is rebuilt in learn()
+        # so backward never crosses a freed graph from a previous step.
+        st = StepState(logits=logits.detach(), value=value.detach(), action=a,
+                       log_prob=log_prob.detach(), z_rate=z_rate.detach(),
+                       frame=x.detach(), is_exploration=is_expl)
+        return a, st
 
-    # --------------------------------------------------------------- learn
-    def learn(self, pending: Transition, r: float,
-              next_pending: Transition, done: bool,
-              reset_on_done: bool = True):
-        """Streaming TD(λ) Q update + SPR auxiliary update (delayed K steps).
+    # ----------------------------------------------------------- learn
+    def learn(self, pending: StepState, r: float,
+              next_state: StepState = None, done: bool = False):
+        """One e-prop update step (reward-based, Eq. 5/36).
 
-        Two gradient paths, kept separate so they don't conflict:
-          * Q gradient  → AdaptiveObGD (traced TD(λ), ×δ, κ-bound, utility gate)
-          * SPR gradient → SGD, orthogonalized against Q, norm-bounded
-
-        The SPR loss at time t needs target latents from o_{t+1..t+K}, so it
-        is computed K steps late via a fixed-length delay queue (NOT a replay
-        buffer — just K=3 held transitions).
+        Computes δ = r + γV' − V, the neuron-specific learning signal L_j,
+        accumulates the F_γ-filtered eligibility tag, and applies the update
+        to Win/Wrec. The readout is updated by autograd on the actor-critic
+        loss. (Symmetric e-prop: B_jk = Wout_kjᵀ is a live view, no separate
+        update.)
         """
         cfg = self.cfg
-        q_sa = pending.logits[0, pending.action]
-        v_next_q = 0.0 if done else float(next_pending.logits.detach()[0].max().item())
-        v_next_q = max(-cfg.q_clip, min(cfg.q_clip, v_next_q))
-        td_err = float(r + cfg.gamma * v_next_q * (0.0 if done else 1.0)
-                       - float(q_sa.detach()))
+        v = pending.value
+        v_next = torch.tensor(0.0) if done else next_state.value.detach()
+        # ---- optional clip of critic bootstrap + TD error (0 = off) ----
+        # OFF by default: v_clip=10 < |true Pong return| = 21 makes the TD
+        # targets inconsistent (critic can never fit, rams into the clip), and
+        # delta_clip censors the terminal-scoring events — the highest-value
+        # samples. ObGD's δ̄ = max(|δ|,1) normalization auto-shrinks the step
+        # for large δ, making these clips unnecessary (stream-x runs unclipped).
+        v_val = float(v.item())
+        v_next_val = float(v_next.item())
+        if cfg.v_clip > 0:
+            v_val = max(-cfg.v_clip, min(cfg.v_clip, v_val))
+            v_next_val = max(-cfg.v_clip, min(cfg.v_clip, v_next_val))
+        delta = float(r + cfg.gamma * v_next_val * (0.0 if done else 1.0) - v_val)
+        if cfg.delta_clip > 0:
+            delta = max(-cfg.delta_clip, min(cfg.delta_clip, delta))
+        self.last_td_err = delta
 
-        self.last_td_err = td_err
-        self.last_entropy = 0.0
-        self.last_v = float(q_sa.detach().item())
+        # ---- learning signal L_j (Eq. 37) ----
+        #   L_j = c_V * B^V_j  +  Σ_k B^π_jk (π_k − 1_{a=k})
+        # The VALUE term is a CONSTANT (c_V · B^V_j): it only tells neuron j
+        # how much it influences the value prediction. The value ERROR itself
+        # is carried by the global δ_t in eprop_opt.step(delta) (Eq. 36), NOT
+        # by an extra factor inside L_j. The previous code multiplied by
+        # (V_{t+1} − V), which (a) is not in the paper and (b) collapses to ~0
+        # whenever V is flat — switching off the critic channel entirely.
+        probs = F.softmax(pending.logits, dim=-1)
+        policy_err = probs.clone()
+        policy_err[pending.action] -= 1.0          # (π_k − 1_{a=k})
+        critic_err = 1.0   # constant value term; error is gated by δ_t (Eq. 36)
+        L_j = self.feedback.learning_signal(policy_err, critic_err, cfg.c_v)
 
-        reset = bool(done and reset_on_done) or pending.is_exploration
+        # ---- accumulate e-prop tags: tag <- γ·tag + L_j · ε̄_ji ----
+        elig_win = self.core.eligibility_win()     # [n_total, n_input]
+        elig_wrec = self.core.eligibility_wrec()   # [n_total, n_total]
+        self.eprop_opt.accumulate(L_j, elig_win, self.core.Win, 0)
+        self.eprop_opt.accumulate(L_j, elig_wrec, self.core.Wrec, 1)
 
-        # ---- Q gradient (for ObGD) ----
-        grads_q = torch.autograd.grad(-q_sa, self.obgd_params, allow_unused=True,
-                                      retain_graph=True)
-        grads_q = [g if g is not None else torch.zeros_like(p)
-                   for g, p in zip(grads_q, self.obgd_params)]
+        # ---- e-prop update on Win/Wrec ----
+        self.eprop_opt.set_episode_length(self._current_max_len())
+        self.eprop_opt.step(delta)
 
-        # ---- ObGD step (Q only) ----
-        gates = self.utility.update_param_utility(td_err, self.opt.traces)
-        self.opt.step(td_err, grads_q, reset_traces=reset, update_mask=gates)
+        # ---- readout + CNN update (autograd ObGD, δ-free losses) ----
+        # Rebuild the readout forward on the pending step's (z, y_prev) snapshot
+        # so the autograd graph is fresh (the act() graph was detached/freed).
+        # ObGD multiplies the traced gradient by δ itself, so the losses must
+        # NOT contain δ (stream AC form; see model/optim.py):
+        #   policy: −log π(a)           -> update += step·δ·∇log π  (PG ascent)
+        #   value:  −c_V·V              -> update += step·c_V·δ·∇V (semi-grad TD)
+        #   cnn:    −(L_in · p)         -> update += step·δ·∇(L_in·p) (Eq. 36)
+        y_fresh = self.readout.forward_from(self.readout._y_prev,
+                                            pending.z_rate)
+        logits_fresh = y_fresh[:self.n_actions]
+        value_fresh = y_fresh[self.n_actions]          # differentiable V (critic)
+        probs_fresh = F.softmax(logits_fresh, dim=-1)
+        log_prob_fresh = torch.log(probs_fresh[pending.action] + 1e-12)
+        sign_d = 1.0 if delta >= 0.0 else -1.0
+        policy_loss = -log_prob_fresh
+        if cfg.entropy_coef > 0:
+            # entropy bonus weighted by sign(δ) (stream-x): encourage
+            # exploration when outcomes are worse than expected
+            ent = -(probs_fresh * torch.log(probs_fresh + 1e-12)).sum()
+            policy_loss = policy_loss - cfg.entropy_coef * sign_d * ent
+        value_loss = -cfg.c_v * value_fresh
 
-        # ---- SPR: enqueue this transition, compute loss if queue is full ----
-        spr_grads = None
-        self.spr_queue.append(pending)
-        if len(self.spr_queue) == cfg.spr_horizon and not done:
-            spr_grads = self._compute_spr_grads()
+        if cfg.train_cnn:
+            # ---- input-layer learning signal (symmetric e-prop, one more hop) ----
+            # L_in = Winᵀ · L_j : input unit i's influence on the loss flows
+            # through Win — the same locality approximation the paper makes for
+            # L_j (its Fig. 4b: error fed back to the spiking CNN as well).
+            # The CNN is feedforward within a frame, so its eligibility is the
+            # ordinary local gradient through rates p (E[spikes] = p — the
+            # Rao-Blackwellized straight-through at the Bernoulli sampling).
+            L_in = self.core.Win.detach().t() @ L_j.detach()      # [n_input]
+            p_in = self.cnn.rates(pending.frame)                  # differentiable
+            cnn_loss = -(L_in * p_in).sum()
+        else:
+            cnn_loss = 0.0
 
-        # ---- SPR gradient: orthogonalize against Q, norm-bound, SGD step ----
-        if spr_grads is not None:
-            self._spr_step(spr_grads, grads_q)
+        total_loss = policy_loss + value_loss + cnn_loss
+        self.stream_opt.zero_grad()
+        total_loss.backward()
+        self.stream_opt.step(delta, reset=done)
 
-        # ---- update the target encoder (EMA) ----
-        self.target_enc.update(self.encoder)
-
-        # ---- epsilon decay + plasticity ----
+        # ---- plasticity regen ----
         self.global_step += 1
-        self._update_epsilon()
-        if self.global_step % cfg.regen_every == 0:
-            self._regenerate()
+        self.utility.maybe_regen(self.global_step, self.core, self.readout)
 
-        return td_err
+        return delta
 
-    def _compute_spr_grads(self):
-        """Compute the SPR loss gradient w.r.t. ALL learnable params (encoder+SPR).
+    # ----------------------------------------------------------- diagnostics
+    def b_drift(self) -> float:
+        # Symmetric e-prop: B = Woutᵀ (live view), so there is no separate B
+        # to drift. Kept as a no-op so logging/CSV columns stay compatible.
+        return self.feedback.drift_from_init()
 
-        The transition model unrolls from the OLDEST queued transition's latent,
-        predicting K steps ahead. Targets come from the EMA target encoder run
-        on the queued future observations (stop-gradient).
-        """
-        cfg = self.cfg
-        queue = list(self.spr_queue)
-        K = len(queue)
-        z0 = queue[0].head_features  # [1, 256], in-graph from the online encoder
+    def tag_norms(self):
+        return self.eprop_opt.tag_norms
 
-        # unroll the transition model K steps
-        pred_latents = []
-        z_cur = z0
-        for k in range(K):
-            z_cur = self.spr_transition(z_cur, queue[k].action)
-            pred_latents.append(self.spr_projection(z_cur))
-
-        # target latents from the EMA target encoder (stop-gradient)
-        with torch.no_grad():
-            target_projs = []
-            for k in range(K):
-                z_tgt = self.target_enc.encode(queue[k].obs)  # [1, 256]
-                # apply the SAME projection head (stop-grad) — the paper allows sharing
-                target_projs.append(self.spr_projection(z_tgt))
-
-        loss = spr_loss(pred_latents, target_projs)
-        all_params = self.obgd_params + self.spr_params
-        grads = torch.autograd.grad(loss, all_params, allow_unused=True,
-                                    retain_graph=False)
-        return [g if g is not None else torch.zeros_like(p)
-                for g, p in zip(grads, all_params)]
-
-    def _spr_step(self, spr_grads_all, grads_q):
-        """Orthogonalize the SPR gradient against Q, norm-bound, SGD step.
-
-        spr_grads_all: gradients w.r.t. (obgd_params + spr_params).
-        grads_q:       the Q gradient w.r.t. obgd_params (from the Q path).
-        """
-        cfg = self.cfg
-        n_obgd = len(self.obgd_params)
-        spr_grads_obgd = spr_grads_all[:n_obgd]
-        spr_grads_spr = spr_grads_all[n_obgd:]
-
-        # ---- norm-bound the full SPR gradient before orthogonalization ----
-        total_norm = 0.0
-        for g in spr_grads_obgd + spr_grads_spr:
-            total_norm += float((g.flatten() ** 2).sum().item())
-        total_norm = (total_norm + 1e-12) ** 0.5
-        scale = min(1.0, cfg.spr_grad_clip / total_norm)
-        spr_grads_obgd = [g * scale for g in spr_grads_obgd]
-        spr_grads_spr = [g * scale for g in spr_grads_spr]
-
-        # ---- orthogonalize the encoder part against Q ----
-        spr_orth_obgd = []
-        for g_q, g_spr in zip(grads_q, spr_grads_obgd):
-            dot = float((g_q.flatten() * g_spr.flatten()).sum().item())
-            nq = float((g_q.flatten() ** 2).sum().item()) + 1e-12
-            spr_orth_obgd.append(g_spr - (dot / nq) * g_q)
-
-        # ---- SGD step (encoder part orthogonalized, SPR params unmodified) ----
-        with torch.no_grad():
-            for p, g in zip(self.obgd_params, spr_orth_obgd):
-                p.data.add_(g.reshape(p.shape), alpha=-float(cfg.spr_lr))
-            for p, g in zip(self.spr_params, spr_grads_spr):
-                p.data.add_(g.reshape(p.shape), alpha=-float(cfg.spr_lr))
-
-    def _regenerate(self):
-        cfg = self.cfg
-        dead = self.utility.dormant_units(self.since_active, cfg.dormant_silence_steps)
-        if len(dead) == 0:
-            return
-        with torch.no_grad():
-            self.heads.q.weight[:, dead] = 0.0
-            fc_w = self.encoder.fc.weight
-            for j in dead:
-                if j < fc_w.shape[0]:
-                    b = (1.0 / fc_w.shape[1]) ** 0.5
-                    fc_w[j] = torch.empty_like(fc_w[j]).uniform_(-b, b)
-            self.since_active[dead] = 0
-        self._last_regen = len(dead)
-
-    # ----------------------------------------------------------------- stats
-    def event_flops(self) -> int:
-        return self.encoder.flops()
-
-    def dense_flops(self) -> int:
-        d = self.encoder.dense_flops()
-        d += self.cfg.trunk_dim * self.n_actions * 2
-        return d
+    def dormant_frac(self) -> float:
+        return self.utility.dormant_frac()

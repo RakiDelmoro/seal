@@ -1,14 +1,12 @@
-"""SEAL inference entrypoint — run a trained agent greedily, no learning.
+"""SEAL inference — play ALE Pong from a trained e-prop LSNN checkpoint.
 
-Loads a checkpoint produced by train.py, restores the model weights + the
-streaming observation normalizer, sets ε=0 (pure greedy), and plays the game
-with a live Pygame GUI. No learning, no CSV, no checkpointing — just watch it
-play.
+Loads a checkpoint, restores the model + observation normalizer, sets the
+policy to greedy (argmax over actor π), and plays with a live Pygame GUI.
+No learning, no e-prop updates — just watch it play.
 
 Usage:
   python play.py --checkpoint results/seal-pong_best.pt
-  python play.py --checkpoint results/seal-pong_best.pt --episodes 20
-  python play.py --checkpoint results/seal-pong_best.pt --fps 30
+  python play.py --checkpoint results/seal-pong_best.pt --episodes 20 --fps 30
 """
 from __future__ import annotations
 import os, time, argparse, collections
@@ -16,7 +14,7 @@ import numpy as np
 import torch
 
 from config import config_from_preset
-from env.envs import make_env, warmup, find_norm_stats, restore_norm_stats
+from env.envs import make_env, find_norm_stats, restore_norm_stats
 from model.agent import SEALAgent
 
 
@@ -28,33 +26,18 @@ def play(checkpoint_path: str, env_id: str, episodes: int, fps_cap: int,
     env_id = ck.get("env_id", env_id)
     cfg = config_from_preset(env_id, total_frames=1, run_name="play")
 
-    env, spec = make_env(env_id, seed=seed, frame_stack=cfg.frame_stack,
-                         render=True)
+    env, spec = make_env(env_id, seed=seed, render=True)
     agent = SEALAgent(cfg, n_actions=spec.n_actions, device="cpu")
 
-    # restore model weights (drop keys that don't exist or whose lazy cache
-    # shapes don't match yet — x_prev/out_prev are episode caches that get
-    # populated on the first forward pass, not needed from the checkpoint)
     sd = ck["model_state"]
     model_sd = agent.state_dict()
-    filtered = {}
-    for k, v in sd.items():
-        if k not in model_sd:
-            continue
-        if v.shape != model_sd[k].shape:
-            continue
-        filtered[k] = v
+    filtered = {k: v for k, v in sd.items()
+                if k in model_sd and v.shape == model_sd[k].shape}
     agent.load_state_dict(filtered, strict=False)
-    # restore the observation normalizer so inputs match what the agent trained on
     restore_norm_stats(env, ck.get("norm_mean"), ck.get("norm_var"),
                        ck.get("norm_count", 0))
-
-    # pure greedy — no exploration, no learning
-    agent.epsilon = 0.0
     agent.eval()
-    agent.last_v = 0.0
 
-    # ---- GUI ----
     pygame.init()
     scale = 3
     game_w, game_h = 160 * scale, 210 * scale
@@ -65,7 +48,6 @@ def play(checkpoint_path: str, env_id: str, episodes: int, fps_cap: int,
     font_sm = pygame.font.SysFont("monospace", 13)
     frame_period = 1.0 / fps_cap if fps_cap else 0.0
     last_frame_time = time.time()
-
     scores = collections.deque(maxlen=20)
     ep = 0
 
@@ -73,24 +55,23 @@ def play(checkpoint_path: str, env_id: str, episodes: int, fps_cap: int,
         while ep < episodes:
             agent.reset_episode()
             obs, _ = env.reset(seed=seed + ep)
-            a, tr = agent.act(obs)
+            a, st = agent.act(obs)
+            # greedy action (argmax over the policy)
+            a = int(st.logits.argmax().item())
             ep_ret = 0.0
             done = False
-            agent.last_v = float(tr.logits[0, a].item())
 
             while not done:
                 for ev in pygame.event.get():
                     if ev.type == pygame.QUIT:
                         raise KeyboardInterrupt
-
                 next_obs, r, term, trunc, info = env.step(a)
                 done = bool(term or trunc)
                 ep_ret += float(info.get("raw_reward", r))
                 if not done:
-                    a, tr = agent.act(next_obs)
-                    agent.last_v = float(tr.logits[0, a].item())
+                    _, st = agent.act(next_obs)
+                    a = int(st.logits.argmax().item())
 
-                # render
                 img = env.render()
                 if img is not None:
                     surf = pygame.surfarray.make_surface(np.transpose(img, (1, 0, 2)))
@@ -106,7 +87,8 @@ def play(checkpoint_path: str, env_id: str, episodes: int, fps_cap: int,
                         (f"mean20   {mean_score:+.2f}", (200, 200, 200), font),
                         (f"played   {len(scores)} eps", (160, 160, 160), font_sm),
                         (f"", (0, 0, 0), font_sm),
-                        (f"Q(s,a)   {agent.last_v:+.2f}", (170, 170, 170), font_sm),
+                        (f"spike    {agent.last_spike_rate_hz:.1f} Hz", (170, 170, 170), font_sm),
+                        (f"entropy  {agent.last_entropy:.3f}", (170, 170, 170), font_sm),
                     ]
                     y = 8
                     for txt, col, fnt in lines:

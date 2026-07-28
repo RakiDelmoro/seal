@@ -31,7 +31,7 @@ ALE/Pong-v5  (raw RGB)
    │  Resize(84) → Grayscale → NormalizeObservation (streaming Welford, clip ±5)
    │  → ONE normalized 84×84 frame per env step  (no frame stacking)
    ▼
-SpikingCNN (fixed-weight stride-conv front-end)
+SpikingCNN (TRAINABLE stride-conv front-end, paper Fig. 4b)
    │  Conv(1→32, 8, s5) → LeakyReLU → Conv(32→64, 4, s3) → LeakyReLU
    │  rectified-proportional rate coding → input spike trains  [1600 units]
    ▼
@@ -39,13 +39,15 @@ LSNN recurrent core  (sim_ms_per_step = 4 ms of sub-stepping at dt = 1 ms)
    │  240 LIF + 160 ALIF neurons, Win [400,1600], Wrec [400,400]
    │  Eligibility traces ε_ji (Eq. 14/22-25) updated each ms, forward-only
    ▼
-Leaky readout (Eq. 11)  → actor logits [6] + critic V [1]
-   │  softmax policy π(a|y) → sample action
+LayerNorm(z_rate) → Leaky readout (Eq. 11)  → actor logits [6] + critic V [1]
+   │  softmax policy π(a|y) → ε-greedy action (explore_eps, stream-x recipe)
    ▼
-env.step(a) → r, next_obs  →  δ = r + γV' − V
+env.step(a) → r, next_obs  →  δ = r + γV' − V   (unclipped; ObGD δ̄-normalizes)
    │
-   ├── e-prop on Win/Wrec:  ΔW = η·δ·F_γ(L_j · ε̄_ji)   (Eq. 5/36)
-   ├── autograd SGD on readout (actor-critic loss)
+   ├── e-prop on Win/Wrec:  ΔW = step·δ·F_γλ(L_j · ε̄_ji)   (Eq. 5/36)
+   │     step overshooting-bounded (ObGD): step = η/max(1, δ̄·‖tag‖₁·η·κ)
+   ├── ObGD on readout + CNN (autograd, δ-free losses, per-group κ/weight-decay)
+   │     CNN learning signal: L_in = Winᵀ·L_j (one more symmetric-feedback hop)
    └── B_jk = Wout_kjᵀ  (symmetric e-prop, read live — no separate update)
    │
    discard sample  →  loop
@@ -67,12 +69,13 @@ seal/
   model/
     agent.py               # SEALAgent (encoder + core + heads + e-prop step)
     neurons.py             # LIF, ALIF cells (Eqs. 6-10) + pseudo-derivative ψ
-    spiking_conv.py        # fixed stride-conv front-end -> input spike trains
+    spiking_conv.py        # TRAINABLE stride-conv front-end -> input spike trains
     lsnn.py                # recurrent LSNN core (Win, Wrec, eligibility traces)
     eligibility.py         # ε-vector recursion (Eq. 14), ε-trace (Eqs. 22-25)
-    readout.py             # leaky actor + critic heads (Eq. 11), autograd-trained
+    readout.py             # leaky actor + critic heads (Eq. 11) + LayerNorm input
     broadcast.py           # symmetric B_jk = Wout_kjᵀ feedback weights (live view)
-    eprop_optimizer.py     # ΔW = η·δ·F_γ(tag); episode-length η schedule
+    eprop_optimizer.py     # ΔW = step·δ·F_γλ(tag), ObGD-bounded step
+    optim.py               # ObGD (Elsayed et al. 2024): overshooting-bounded GD
     utility.py             # dormant spiking-unit regeneration
     metrics.py             # CSV logger, spike-rate, policy entropy
   env/
@@ -130,11 +133,37 @@ python play.py --checkpoint results/seal-pong_best.pt
   plasticity rule; it tracks Wout automatically.
 
 ### Reward-based e-prop (`model/eprop_optimizer.py`, `model/agent.py`)
-- Plasticity rule (Eq. 5/36): `ΔW_ji = η·δ_t·F_γ(L_j^t · ε̄_ji^t)`.
-- δ = r + γV_{t+1} − V_t (reward prediction error).
+- Plasticity rule (Eq. 5/36): `ΔW_ji = step·δ_t·F_γλ(L_j^t · ε̄_ji^t)`.
+- δ = r + γV_{t+1} − V_t (reward prediction error), unclipped.
 - L_j (Eq. 37): `Σ_k B_jk·(π_k − 1_{a=k}) + c_V·B_j^V` — neuron-specific.
-- Readout on autograd/SGD (feedforward, Eq. 11); Win/Wrec on e-prop.
-- Stability via **episode-length schedule** (increasing lengths, η ∝ 1/√len).
+- Win/Wrec on e-prop; readout + CNN on autograd ObGD (feedforward; e-prop
+  not needed there, per Methods + the paper's own Atari code).
+- Stability via **ObGD overshooting bound** (below); the episode-LENGTH
+  curriculum (increasing lengths) is kept, but its η ∝ 1/√len coupling is
+  off — ObGD supersedes it.
+
+### ObGD — streaming-RL sample efficiency (`model/optim.py`)
+From "Streaming Deep RL Finally Works" (Elsayed et al. 2024): streaming RL
+fails through instability, not information scarcity (the "stream barrier").
+ObGD keeps a per-parameter γλ eligibility trace of the gradient and bounds
+the *effective* step size: `step = η / max(1, δ̄·‖e‖₁·η·κ)`. This allows
+η = O(1) — every sample takes the largest stable step instead of ~1e-6
+scraps. Applied to (a) the e-prop tag update on Win/Wrec, (b) the readout
+(actor/critic groups, κ=10, small weight decay), (c) the CNN front-end.
+Companion ingredients from the same paper: LayerNorm on the readout input
+(makes the bound operative), ε-greedy exploration (decouples exploration
+from policy sharpness), λ=0.8 traces on the autograd path.
+
+### Trainable spiking CNN front-end (paper Fig. 4b)
+The paper feeds the prediction error "back both to the LSNN **and the spiking
+CNN**" (Fig. 4b caption; their code trains the torso with its own optimizer).
+SEAL does this the e-prop way: the input-layer learning signal
+`L_in = Winᵀ·L_j` (one more hop of symmetric feedback) is injected at the
+spike rates `p` (E[spikes] = p — Rao-Blackwellized straight-through), and
+autograd takes the local gradient through the feedforward conv stack. No
+BPTT: the CNN is memoryless within a frame. A frozen random encoder is an
+information bottleneck that caps sample efficiency. Ablation: `--train_cnn`
+config flag (False = frozen random).
 
 ### Plasticity (`model/utility.py`)
 - Dormant = no spike for `dormant_silence_ms`. Every `regen_every` steps, the
@@ -148,3 +177,6 @@ python play.py --checkpoint results/seal-pong_best.pt
 - Bellec, Scherr, Subramoney et al., "A solution to the learning dilemma for
   recurrent networks of spiking neurons", *Nature Communications* 11:3625
   (2020). https://doi.org/10.1038/s41467-020-17236-y
+- Elsayed, Vasan & Mahmood, "Streaming Deep Reinforcement Learning Finally
+  Works", arXiv:2410.14606 (2024). ObGD, LayerNorm, ε-greedy, sparse/
+  streaming techniques (stream-x algorithms). Code: github.com/mohmdelsayed/streaming-drl

@@ -2,14 +2,13 @@
 
 Single entry point: make_env(preset_id, seed) -> (env, EnvSpec).
 
-4-frame stacking provides temporal context (velocity is in the 4 stacked
-frames), matching the streaming-RL paper's proven Atari architecture. The
-event-driven encoder then processes frame-to-frame deltas across these
-channels.
+ONE normalized 84x84 grayscale frame per env step. Temporal context is
+carried by the recurrent LSNN core (e-prop), not by frame stacking — so no
+FrameStackWrapper. The Welford streaming normalizer is warmed up for ~1k
+frames before learning starts.
 """
 from __future__ import annotations
 import os
-from collections import deque
 import numpy as np
 import gymnasium as gym
 
@@ -35,49 +34,11 @@ class EnvSpec:
         self.dtype = dtype
 
 
-class FrameStackWrapper(gym.Wrapper):
-    """Stack the last N frames as separate channels. Replaces EMA.
-
-    Output is (H, W, N) — N copies of the grayscale frame at t, t-1, ..., t-N+1.
-    This gives the conv exact positions to difference (velocity), matching the
-    streaming-RL paper's proven Atari input. On reset, the first frame is
-    stacked N times (no zero-padding — avoids a discontinuity delta).
-    """
-    def __init__(self, env: gym.Env, num_stack: int = 4):
-        super().__init__(env)
-        self.num_stack = int(num_stack)
-        self.frames = deque(maxlen=self.num_stack)
-        obs_shape = env.observation_space.shape
-        # output: (H, W, N)
-        stacked_shape = obs_shape[:-1] + (self.num_stack,)
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=stacked_shape, dtype=np.float32)
-
-    def _stack(self, obs):
-        obs = np.array(obs, dtype=np.float32)
-        if obs.ndim == 2:
-            obs = obs[:, :, None]
-        self.frames.append(obs)
-        # pad cold start with copies of the first frame
-        while len(self.frames) < self.num_stack:
-            self.frames.appendleft(obs.copy())
-        return np.concatenate(list(self.frames), axis=-1)  # (H, W, N)
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        return self._stack(obs), reward, terminated, truncated, info
-
-    def reset(self, **kwargs):
-        self.frames.clear()
-        obs, info = self.env.reset(**kwargs)
-        return self._stack(obs), info
-
-
-def _build_atari(preset: EnvPreset, seed: int, frame_stack: int = 4,
-                 render: bool = False):
+def _build_atari(preset: EnvPreset, seed: int, render: bool = False):
     """ALE Pong pipeline:
     NoopReset -> MaxAndSkip(4) -> EpisodicLife -> FireReset
-    -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5) -> FrameStack(4).
+    -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5).
+    No frame stacking — the recurrent LSNN core carries temporal context.
     No reward scaling (Pong rewards are already ±1)."""
     render_mode = "rgb_array" if render else None
     env = gym.make(preset.id, render_mode=render_mode)
@@ -91,15 +52,13 @@ def _build_atari(preset: EnvPreset, seed: int, frame_stack: int = 4,
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
     env = NormalizeObservation(env, clip=5.0)
-    env = FrameStackWrapper(env, num_stack=frame_stack)
     obs, _ = env.reset(seed=seed)
     obs_chw = np.moveaxis(np.asarray(obs), -1, 0) if obs.ndim == 3 else obs
     spec = EnvSpec(preset, obs_chw.shape, env.action_space.n)
     return env, spec
 
 
-def make_env(env_id: str, seed: int = 0, frame_stack: int = 4,
-             render: bool = False):
+def make_env(env_id: str, seed: int = 0, render: bool = False):
     """Build the wrapped env + EnvSpec for one preset id.
 
     render=True builds the env with render_mode='rgb_array' so a GUI can
@@ -107,8 +66,7 @@ def make_env(env_id: str, seed: int = 0, frame_stack: int = 4,
     """
     preset = PRESETS[env_id]
     if preset.domain == "atari":
-        env, spec = _build_atari(preset, seed, frame_stack=frame_stack,
-                                 render=render)
+        env, spec = _build_atari(preset, seed, render=render)
     else:
         raise ValueError(f"Unknown domain for env {env_id}: {preset.domain}")
     return env, spec
@@ -117,7 +75,7 @@ def make_env(env_id: str, seed: int = 0, frame_stack: int = 4,
 def obs_to_chw(obs) -> np.ndarray:
     """Convert a gym obs (H,W,C) to agent-facing (C,H,W) float32."""
     obs = np.asarray(obs)
-    if obs.ndim == 3 and obs.shape[-1] in (1, 3, 4):
+    if obs.ndim == 3 and obs.shape[-1] in (1, 3):
         return np.moveaxis(obs, -1, 0).astype(np.float32)
     if obs.ndim == 2:
         return obs[None].astype(np.float32)
