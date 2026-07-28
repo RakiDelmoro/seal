@@ -47,9 +47,6 @@ class Config:
     # ---- environment ----
     env_id: str = "ALE/Pong-v5"
     seed: int = 0
-    # ONE normalized 84x84 frame per env step; the recurrent LSNN core carries
-    # temporal context (replaces the old 4-frame stack).
-    frame_stack: int = 1
 
     # ---- RL (actor-critic, reward-based e-prop) ----
     gamma: float = 0.99            # discount factor γ (Rt = Σ γ^k r_{t+k})
@@ -92,8 +89,6 @@ class Config:
     # ---- LSNN core (recurrent) ----
     n_lif: int = 240               # number of LIF neurons
     n_alif: int = 160              # number of ALIF neurons
-    rec_sparsity: float = 0.0      # fraction of recurrent weights zeroed (0 = dense)
-    dale: bool = False             # Dale's law (E/I split) — off by default
     win_scale: float = 0.02        # input weight init scale (kept small for sparse firing)
     wrec_scale: float = 0.01       # recurrent weight init scale
     # ALIF eligibility-trace simplification: if True, drop the ψ·β term in
@@ -109,14 +104,11 @@ class Config:
     # stack; δ-gating + γλ traces live in the ObGD optimizer. A frozen random
     # encoder is an information bottleneck that caps sample efficiency.
     train_cnn: bool = True              # train the front-end (False = frozen ablation)
-    cnn_feedback: str = "symmetric"     # 'symmetric' (Winᵀ) | 'random' (paper's ba_cnn)
     conv_layers: tuple = (
         (1, 32, 8, 5),             # (in_ch, out_ch, kernel, stride): 84 -> 16
         (32, 64, 4, 3),            # 16 -> 5
     )
-    n_input_neurons: int = 1600        # flattened conv output -> input spike units
-    input_spike_rate: float = 0.05      # target input firing rate (per ms; ~50 Hz)
-    input_gain_init: float = 1.0        # initial sigmoid gain for input encoding
+
 
     # ---- readout (leaky output neurons, Eq. 11) ----
     n_actions: int = 6
@@ -178,7 +170,6 @@ class Config:
         (500_000,   1200),
         (1_000_000, 2000),    # full-length from here on
     )
-    eta_length_scale: bool = False   # legacy: scale η by 1/sqrt(len) — superseded by ObGD
 
     # ---- plasticity (dormant spiking-unit regeneration) ----
     # Observed failure at 100k frames: dormant_frac climbing monotonically to
@@ -191,7 +182,6 @@ class Config:
     # ---- training / logging ----
     total_frames: int = 10_000_000
     log_every: int = 1_000
-    record_frames: int = 10_000
     warmup_frames: int = 1_000       # random-action warmup (normalize stats, no learn)
 
     # ---- output ----

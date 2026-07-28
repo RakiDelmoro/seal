@@ -111,7 +111,6 @@ class LeakyReadout(nn.Module):
         y_prev = self.y.clone()  # capture BEFORE step_ms mutates
         y = self.step_ms(spike_rate)
         # snapshot so learn() can recompute a fresh graph without mutating state.
-        self._z_last = spike_rate.detach()
         self._y_prev = y_prev
         logits, value = self._split_y(y)
         logits = self._cap(logits)

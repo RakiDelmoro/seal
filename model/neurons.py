@@ -96,17 +96,9 @@ class LIFNeurons:
             self.v = v_new
         return z, psi
 
-    def state_vector(self) -> torch.Tensor:
-        """Hidden state h = [v] (1-D)."""
-        return self.v
-
     def dh_dh_prev(self) -> torch.Tensor:
         """∂h_t/∂h_{t-1} = ∂v_t/∂v_{t-1} = α (scalar, Eq. 22)."""
         return torch.tensor(self.alpha)
-
-    def dh_dw(self, z_pre: torch.Tensor) -> torch.Tensor:
-        """∂h_t/∂W_ji = z_pre[i] = presynaptic spike at t-1 (Eq. 22)."""
-        return z_pre
 
 
 class ALIFNeurons:
@@ -170,10 +162,6 @@ class ALIFNeurons:
             self.a = a_new
         return z, psi
 
-    def state_vector(self) -> torch.Tensor:
-        """Hidden state h = [v, a] (2-D, shape [n, 2])."""
-        return torch.stack([self.v, self.a], dim=-1)
-
     def dh_dh_prev(self, psi: torch.Tensor) -> torch.Tensor:
         """∂h_t/∂h_{t-1} as a 2x2 matrix (per-neuron, Eq. 24 derivation).
 
@@ -193,11 +181,3 @@ class ALIFNeurons:
         J[:, 1, 0] = psi               # ∂a/∂v_prev
         # ∂v/∂a_prev = 0
         return J
-
-    def dh_dw(self, z_pre: torch.Tensor) -> torch.Tensor:
-        """∂h_t/∂W_ji = [z_pre[i], 0] (only v depends directly on W; Eq. 13)."""
-        n = self.n
-        d = z_pre.shape[0]
-        out = torch.zeros(n, 2, d)
-        out[:, 0, :] = z_pre.unsqueeze(0).expand(n, d)
-        return out

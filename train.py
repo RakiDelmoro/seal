@@ -28,7 +28,7 @@ from tqdm import tqdm
 from config import config_from_preset
 from env.envs import make_env, warmup, find_norm_stats, restore_norm_stats
 from model.agent import SEALAgent
-from model.metrics import CSVLogger, policy_entropy
+from model.metrics import CSVLogger
 
 CSV_COLUMNS = ["step", "episode", "return", "td_err", "v", "spike_rate_hz",
                "policy_entropy", "b_drift", "tag_norm_win", "tag_norm_wrec",

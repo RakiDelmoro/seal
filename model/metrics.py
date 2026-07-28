@@ -2,7 +2,6 @@
 from __future__ import annotations
 import os
 import csv
-import torch
 
 
 class CSVLogger:
@@ -34,15 +33,3 @@ class CSVLogger:
         if self._f is not None:
             self._f.close()
             self._f = None
-
-
-def spike_rate_hz(spike_count: torch.Tensor, sim_ms: int) -> float:
-    """Mean per-neuron spike rate in Hz over the env step's sub-steps."""
-    return float(spike_count.mean().item()) / float(sim_ms) * 1000.0
-
-
-def policy_entropy(logits: torch.Tensor) -> float:
-    """Entropy of the softmax policy (nats). Higher = more exploratory."""
-    p = torch.softmax(logits, dim=-1)
-    logp = torch.log_softmax(logits, dim=-1)
-    return float(-(p * logp).sum().item())

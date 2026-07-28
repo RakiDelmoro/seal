@@ -8,7 +8,6 @@ FrameStackWrapper. The Welford streaming normalizer is warmed up for ~1k
 frames before learning starts.
 """
 from __future__ import annotations
-import os
 import numpy as np
 import gymnasium as gym
 
@@ -125,35 +124,3 @@ def restore_norm_stats(env, mean, var, count):
     if norm.count > 1:
         norm._p = norm.var * (norm.count - 1)
 
-
-class FrameRecorder:
-    """Record frames for Stage-1 tests. NOT a replay buffer."""
-    def __init__(self, n: int = 10_000, obs_shape=None):
-        self.n = int(n)
-        self.obs_shape = obs_shape
-        self.frames = []
-        self.done_flags = []
-        self._full = False
-
-    def add(self, obs, done: bool):
-        if self._full:
-            return
-        self.frames.append(obs_to_chw(obs).copy())
-        self.done_flags.append(bool(done))
-        if len(self.frames) >= self.n:
-            self._full = True
-
-    @property
-    def full(self) -> bool:
-        return self._full
-
-    def save(self, path: str):
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        arr = np.stack(self.frames, axis=0) if self.frames else np.zeros((0,), dtype=np.float32)
-        np.save(path, arr)
-        meta_path = os.path.splitext(path)[0] + "_done.npy"
-        np.save(meta_path, np.asarray(self.done_flags, dtype=bool))
-        return path
-
-    def episode_boundaries(self):
-        return [i for i, d in enumerate(self.done_flags) if d]

@@ -87,10 +87,6 @@ class FeedbackWeights(nn.Module):
             L = L + c_v * (self.B_v @ critic_vec)            # [n_total]
             return L
 
-    def reset(self):
-        # B is a live view of Wout — nothing to reset.
-        pass
-
     def drift_from_init(self, B_init: torch.Tensor = None) -> float:
         """No-op diagnostic. Symmetric B tracks Wout^T; there is no separate
         B to drift. Returns 0.0 so existing logging/columns stay valid."""

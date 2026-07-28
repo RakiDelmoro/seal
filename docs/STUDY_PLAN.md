@@ -236,17 +236,16 @@ unusual fix (episode-length schedule) — SEAL's main stability mechanism.
 - Why SEAL uses *on-policy* actor-critic (no max-bootstrap) — sidesteps one
   leg of the triad by construction.
 - The episode-length schedule: short early episodes → diverse, uncorrelated
-  experience → useful skills; then longer episodes → fine-tune. η scaled by
-  `1/√(max_len)` to keep total update magnitude bounded as episodes grow.
+  experience → useful skills; then longer episodes → fine-tune. (The paper's
+  η ∝ 1/√(max_len) coupling was REMOVED — ObGD's overshooting bound supersedes
+  it; keeping both double-shrank η to ~7e-6.)
 
-**Code to map:** `config.py` `episode_schedule` + `eta_length_scale`;
-`model/eprop_optimizer.py` `set_episode_length()`, `_length_factor`.
+**Code to map:** `config.py` `episode_schedule`; `model/agent.py`
+`_current_max_len()` (curriculum only).
 
 **Checkpoint:** SEAL has no replay buffer and no parallel agents — two of the
 three standard deep-RL stabilizers. What replaces them? (Answer: on-policy
-actor-critic + the episode-length/η schedule.) *Exercise:* run a short SEAL
-training with `eta_length_scale=False` and a fixed long episode length from
-step 0 — watch it diverge faster than the scheduled version.
+actor-critic + the episode-length curriculum + ObGD step-size bounds.)
 
 ---
 
@@ -326,9 +325,10 @@ measuring the effect. Pick **one** from the menu below (or propose your own).
    Compare learning curves vs adaptive. *Tests:* the finite-diff eligibility
    check is unchanged; add a test that `B` tracks `Wout^T`.
 
-2. **Sparse + Dale's-law LSNN.** Implement E/I split (config already has
-   `dale`, `rec_sparsity` flags as stubs). Integrate stochastic rewiring
-   (Kappel et al. 2018, ref. 24) so the sparse net stays functional.
+2. **Sparse + Dale's-law LSNN.** Implement E/I split (would re-add config
+   flags — the unimplemented `dale`/`rec_sparsity` stubs were removed in
+   cleanup). Integrate stochastic rewiring (Kappel et al. 2018, ref. 24) so
+   the sparse net stays functional.
    *Why:* paper's Fig. 3c orange curve — biological plausibility upgrade.
 
 3. **Adaptive e-prop's mirror rule: compare schedules.** Sweep

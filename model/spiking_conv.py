@@ -42,17 +42,14 @@ class SpikingCNN(nn.Module):
 
     Args:
         conv_layers: tuple of (in_ch, out_ch, kernel, stride)
-        target_rate: kept for interface compat (homeostasis is via normalization)
         gain: encoding gain on the normalized features
         max_p: cap on per-ms spike probability (soft when trainable)
         seed: init seed
         trainable: if False, freeze weights (ablation: frozen random encoder)
     """
-    def __init__(self, conv_layers: tuple, target_rate: float = 0.10,
-                 gain: float = 0.15, max_p: float = 0.3, seed: int = 0,
-                 trainable: bool = True):
+    def __init__(self, conv_layers: tuple, gain: float = 0.15,
+                 max_p: float = 0.3, seed: int = 0, trainable: bool = True):
         super().__init__()
-        self.target_rate = float(target_rate)
         self.gain = float(gain)        # FIXED global encoding gain
         self.max_p = float(max_p)      # cap per-ms spike probability
         self.trainable = bool(trainable)
@@ -101,23 +98,14 @@ class SpikingCNN(nn.Module):
             p = torch.clamp(x, max=self.max_p)            # hard cap (frozen)
         return p
 
-    def forward(self, frame: torch.Tensor, dt_ms: float = 1.0) -> torch.Tensor:
+    def forward(self, frame: torch.Tensor) -> torch.Tensor:
         """One ms of encoding. Returns input spikes [n_input_neurons].
 
         Samples Bernoulli(rates) under no_grad — the gradient path for the
         conv weights is built separately in agent.learn() via rates() and the
         input-layer learning signal L_in (no autograd through sampling).
-
-        Args:
-            frame: [1, 1, 84, 84] normalized grayscale
-            dt_ms: timestep (unused for Bernoulli; rate is per-ms)
         """
         with torch.no_grad():
             p = self.rates(frame)
             spikes = torch.bernoulli(p)
         return spikes
-
-    def reset(self):
-        """Reset homeostatic state (call on episode boundary, optional)."""
-        # keep gain + rate_ewma across episodes (they track the input statistics)
-        pass

@@ -23,7 +23,7 @@ which traded away ~99% of the step size for stability (η_eff ~ 7e-6) and made
 learning glacial — the "stream barrier" (Elsayed et al. 2024). With the
 overshooting bound, η can be O(1) and every sample takes the largest stable
 step. The episode-LENGTH curriculum (config.episode_schedule) is unaffected;
-only the η-coupling is removed (eta_length_scale now defaults off).
+only the η-coupling is removed (the 1/√len schedule was deleted in cleanup).
 
 Sign convention: the rule ΔW = η·δ·tag implements policy-gradient ASCENT
 (δ>0 reinforces the tagged directions) — we ADD step·δ·tag.
@@ -50,21 +50,16 @@ class EpropOptimizer:
         lam: tag-filter λ (1.0 = paper's F_γ; <1 shortens the credit window)
         kappa: ObGD scaling factor κ (2.0 in the stream-x paper)
         grad_clip: clip on |δ · tag| per parameter (0 = off; ObGD supersedes it)
-        length_scale: legacy — scale η by 1/sqrt(current_max_episode_len).
-            Off by default; superseded by the overshooting bound.
     """
     def __init__(self, params, eta: float = 1.0, gamma: float = 0.99,
-                 lam: float = 1.0, kappa: float = 2.0, grad_clip: float = 0.0,
-                 length_scale: bool = False):
+                 lam: float = 1.0, kappa: float = 2.0, grad_clip: float = 0.0):
         self.params = list(params)
         self.eta = float(eta)
         self.gamma = float(gamma)
         self.lam = float(lam)
         self.kappa = float(kappa)
         self.grad_clip = float(grad_clip)
-        self.length_scale = bool(length_scale)
         self.tags = [torch.zeros_like(p) for p in self.params]
-        self._length_factor = 1.0  # set by set_episode_length() (legacy)
         self.last_update_norm = 0.0
         self.last_step_size = 0.0
 
@@ -72,13 +67,6 @@ class EpropOptimizer:
         """Clear tags (episode boundary)."""
         for t in self.tags:
             t.zero_()
-
-    def set_episode_length(self, max_len: int):
-        """Legacy η ∝ 1/√len scaling (disabled by default; ObGD supersedes it)."""
-        if self.length_scale and max_len > 0:
-            self._length_factor = 1.0 / (max_len ** 0.5)
-        else:
-            self._length_factor = 1.0
 
     def accumulate(self, learning_signal: torch.Tensor, elig_trace: torch.Tensor,
                    weight: torch.Tensor, param_idx: int):
@@ -111,7 +99,6 @@ class EpropOptimizer:
             d_bar = max(abs(delta), 1.0)
             M = d_bar * z_sum * self.eta * self.kappa
             step_size = self.eta / M if M > 1.0 else self.eta
-            step_size *= self._length_factor
             self.last_step_size = step_size
 
             total_norm = 0.0

@@ -44,7 +44,6 @@ class StepState:
     log_prob: torch.Tensor     # scalar (for entropy)
     z_rate: torch.Tensor       # LSNN spike rate [n_total] (readout input)
     frame: torch.Tensor = None  # [1,1,84,84] input frame (for the CNN grad path)
-    is_exploration: bool = False
 
 
 class SEALAgent(nn.Module):
@@ -57,9 +56,8 @@ class SEALAgent(nn.Module):
         self.device = device
 
         # ---- front-end + recurrent core ----
-        self.cnn = SpikingCNN(cfg.conv_layers, target_rate=cfg.input_spike_rate,
-                              gain=0.15, max_p=0.3, seed=cfg.seed,
-                              trainable=cfg.train_cnn)
+        self.cnn = SpikingCNN(cfg.conv_layers, gain=0.15, max_p=0.3,
+                              seed=cfg.seed, trainable=cfg.train_cnn)
         self.core = LSNNCore(cfg, n_input_neurons=self.cnn.n_input_neurons)
 
         # ---- readout (actor + critic) ----
@@ -82,8 +80,7 @@ class SEALAgent(nn.Module):
         self.eprop_opt = EpropOptimizer(
             [self.core.Win, self.core.Wrec],
             eta=cfg.eta_rec, gamma=cfg.gamma, lam=cfg.lam_rec,
-            kappa=cfg.kappa_rec, grad_clip=cfg.grad_clip,
-            length_scale=cfg.eta_length_scale)
+            kappa=cfg.kappa_rec, grad_clip=cfg.grad_clip)
         # Readout + CNN on autograd ObGD (stream-x): ONE optimizer, per-group
         # lr/κ. Separate actor/critic groups (κ_policy=3, κ_value=2 per the
         # paper); the CNN gets its own group. ObGD maintains per-parameter
@@ -174,7 +171,7 @@ class SEALAgent(nn.Module):
         # so backward never crosses a freed graph from a previous step.
         st = StepState(logits=logits.detach(), value=value.detach(), action=a,
                        log_prob=log_prob.detach(), z_rate=z_rate.detach(),
-                       frame=x.detach(), is_exploration=is_expl)
+                       frame=x.detach())
         return a, st
 
     # ----------------------------------------------------------- learn
@@ -228,7 +225,6 @@ class SEALAgent(nn.Module):
         self.eprop_opt.accumulate(L_j, elig_wrec, self.core.Wrec, 1)
 
         # ---- e-prop update on Win/Wrec ----
-        self.eprop_opt.set_episode_length(self._current_max_len())
         self.eprop_opt.step(delta)
 
         # ---- readout + CNN update (autograd ObGD, δ-free losses) ----
