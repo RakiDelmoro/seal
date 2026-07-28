@@ -40,13 +40,25 @@ class LeakyReadout(nn.Module):
         kappa: readout leak exp(-dt/τ_out)
     """
     def __init__(self, n_in: int, n_actor: int, n_critic: int = 1,
-                 kappa: float = 0.95, logit_cap: float = 2.0):
+                 kappa: float = 0.95, logit_cap: float = 2.0,
+                 kappa_critic: float = -1.0):
         super().__init__()
         self.n_in = n_in
         self.n_actor = n_actor
         self.n_critic = n_critic
         self.n_out = n_actor + n_critic
         self.kappa = float(kappa)
+        # Per-channel leak for the critic head. The actor stays leaky
+        # (e-prop Eq. 11, smoothing logits over ~tau_out frames). But a
+        # leaky critic is a ~1/(1-kappa)=20x-gain integrator that
+        # amplifies any DC bias in Wout*z+b into a huge wrong V, AND it
+        # holds that bias in state for ~20 frames so terminal-reward
+        # kicks can't flush it. That combination drove termV from -50 to
+        # -178 in ~600 episodes (a monotonic runaway). Default -1.0 means
+        # "inherit kappa" (legacy behavior); set 0.0 for a memoryless
+        # critic V = Wout*z + b, matching stream-x's value head, which is
+        # what ObGD's normalization was designed for.
+        self.kappa_critic = float(kappa_critic) if kappa_critic >= 0.0 else self.kappa
         # Structural entropy floor: actor logits = cap·tanh(y/cap), so the
         # max logit gap is 2·cap = 4 and π_max ≈ 0.7–0.9 — softmax can never
         # saturate to one-hot, so (π − 1_a) — the policy channel of L_j —
@@ -61,7 +73,17 @@ class LeakyReadout(nn.Module):
         self.Wout_critic = nn.Parameter(torch.empty(n_critic, n_in))
         self.b_critic = nn.Parameter(torch.zeros(n_critic))
         nn.init.kaiming_uniform_(self.Wout_actor, a=0.5)
+        # Critic weights start SMALL: V = Wout_critic@LN(z) + b_critic, and with
+        # kaiming L2~1.3 the Wout@LN(z) noise (std~1.3) swamps b_critic and
+        # injects a negative bias into non-terminal delta (gamma*V'-V) that
+        # sinks b_critic faster than terminal rewards lift it. Scaling to
+        # L2~0.1 makes V≈b_critic initially, so delta is dominated by the
+        # real (gamma-1)*V and terminal r-V signals, which both push b_critic
+        # toward the true mean return. Wout_critic grows back as the TD
+        # signal (clean once b_critic tracks) teaches it state-dependence.
         nn.init.kaiming_uniform_(self.Wout_critic, a=0.5)
+        with torch.no_grad():
+            self.Wout_critic.mul_(0.08)
         # leaky state (combined actor+critic, carried across steps)
         self.y = torch.zeros(self.n_out)
 
@@ -80,7 +102,12 @@ class LeakyReadout(nn.Module):
         """
         i_a = F.linear(z.unsqueeze(0), self.Wout_actor, self.b_actor).squeeze(0)
         i_c = F.linear(z.unsqueeze(0), self.Wout_critic, self.b_critic).squeeze(0)
-        y_new = self.kappa * self.y + torch.cat([i_a, i_c])
+        # Per-channel leak: actor decays by kappa, critic by kappa_critic.
+        # Splitting here (not in forward_from) keeps both paths in sync.
+        y_prev = self.y
+        y_a = self.kappa * y_prev[:self.n_actor] + i_a
+        y_c = self.kappa_critic * y_prev[self.n_actor:] + i_c
+        y_new = torch.cat([y_a, y_c])
         self.y = y_new.detach()
         return y_new
 
@@ -132,7 +159,11 @@ class LeakyReadout(nn.Module):
         z = self._norm(z)   # same normalization as forward() — keep in sync
         i_a = F.linear(z.unsqueeze(0), self.Wout_actor, self.b_actor).squeeze(0)
         i_c = F.linear(z.unsqueeze(0), self.Wout_critic, self.b_critic).squeeze(0)
-        y = self.kappa * y_prev + torch.cat([i_a, i_c])
+        # Per-channel leak — MUST match step_ms() so act() and learn()
+        # see the same function (else the ObGD gradient is wrong).
+        y_a = self.kappa * y_prev[:self.n_actor] + i_a
+        y_c = self.kappa_critic * y_prev[self.n_actor:] + i_c
+        y = torch.cat([y_a, y_c])
         # cap AFTER the κ-mixing, exactly as forward() does — act() and
         # learn() must see ONE function
         return torch.cat([self._cap(y[:self.n_actor]), y[self.n_actor:]])

@@ -63,6 +63,7 @@ class SEALAgent(nn.Module):
         # ---- readout (actor + critic) ----
         self.readout = LeakyReadout(cfg.n_lif + cfg.n_alif, n_actions,
                                     n_critic=1, kappa=cfg.kappa,
+                                    kappa_critic=cfg.kappa_critic,
                                     logit_cap=cfg.logit_cap)
 
         # ---- symmetric e-prop feedback weights (B^π = Wout_actor^T, B^V = Wout_critic^T) ----
@@ -86,13 +87,34 @@ class SEALAgent(nn.Module):
         # paper); the CNN gets its own group. ObGD maintains per-parameter
         # γλ eligibility traces and multiplies by δ itself, so the losses in
         # learn() must be δ-free (see model/optim.py docstring).
+        # Critic group SPLIT: Wout_critic (400-dim, zero-mean grad via
+        # LayerNorm(z)) is in ObGD; b_critic (the scalar value bias) is NOT
+        # -- it is updated by a separate reward-centering EMA in learn()
+        # (Naik et al. 2024). Rationale (verified on the ep2400 checkpoint):
+        # with b_critic in the shared ObGD group, ||e||_1 was dominated by
+        # Wout_critic's 400 noisy zero-mean traces (~1540), shrinking the
+        # step to ~2.6e-6 for both; b_critic needed ~4M steps to track the
+        # mean return, dominated V (V~b_critic=-3), starved Wout_critic
+        # (L2 0.95->0.12), and the critic collapsed to a constant. Even
+        # after splitting groups, the per-step delta driving b_critic via
+        # ObGD is dominated by zero-mean noise from Wout_critic@LN(z)
+        # (spike rates mean-revert -> negative delta bias) that sinks
+        # b_critic faster than terminal rewards lift it (verified: no
+        # upward trend across seeds). Reward centering decouples the bias
+        # (mean return) from that noise: an EMA of delta averages it out,
+        # leaving the true mean-return signal. Wout_critic keeps a moderate
+        # kappa so it holds signal without bouncing, and starts small
+        # (readout.py init) so V~b_critic until the TD signal teaches it
+        # state-dependence.
         self.stream_opt = ObGD(
             [{"params": [self.readout.Wout_actor, self.readout.b_actor],
               "lr": cfg.eta_out, "kappa": cfg.kappa_policy,
               "weight_decay": cfg.wd_policy},
-             {"params": [self.readout.Wout_critic, self.readout.b_critic],
+             {"params": [self.readout.Wout_critic],
               "lr": cfg.eta_out, "kappa": cfg.kappa_value,
-              "weight_decay": cfg.wd_value},
+              "weight_decay": cfg.wd_value,
+              "delta_cap": cfg.critic_delta_cap},
+             # b_critic is NOT in ObGD: see learn() for its reward-centering update.
              {"params": list(self.cnn.parameters()),
               "lr": cfg.eta_cnn, "kappa": cfg.kappa_cnn,
               "weight_decay": cfg.wd_cnn}],
@@ -109,12 +131,27 @@ class SEALAgent(nn.Module):
         self.last_v = 0.0
         self.last_entropy = 0.0
         self.last_spike_rate_hz = 0.0
+        # Reward centering for b_critic (Naik et al. 2024): the scalar value
+        # bias tracks the running mean return via an EMA of the TD error.
+        # E[delta] -> 0 when V equals the true value; a persistent E[delta]>0
+        # means V is too low and pulls b_critic up, E[delta]<0 pushes it down.
+        # This is DECOUPLED from the per-step delta that drives Wout_critic
+        # via ObGD: that per-step delta is dominated by zero-mean noise from
+        # Wout_critic@LayerNorm(z) (spike rates mean-revert), whose negative
+        # bias sinks b_critic faster than terminal rewards lift it (verified:
+        # under ObGD alone b_critic oscillated around -3 with no upward trend).
+        # The EMA averages out that noise, leaving the true mean-return signal.
+        self._delta_ema = 0.0
+        self._bias_centering_lr = cfg.bias_centering_lr
 
     # ----------------------------------------------------------- episode ctl
     def reset_episode(self):
         self.core.reset()
         self.readout.reset()
         self.eprop_opt.reset()
+        # NOTE: _delta_ema is NOT reset on episode boundary — it is a
+        # cross-episode running average of the TD error (the mean-return
+        # signal). Resetting it would discard the centering information.
 
     def warmup_forward(self, obs):
         """Run a forward pass without learning (normalize stats warmup)."""
@@ -267,7 +304,22 @@ class SEALAgent(nn.Module):
         total_loss = policy_loss + value_loss + cnn_loss
         self.stream_opt.zero_grad()
         total_loss.backward()
+        # b_critic must NOT receive an autograd gradient (it is updated by the
+        # reward-centering EMA below, not ObGD). Zero its grad before step so
+        # the value_loss = -c_v*V path (whose d/db_critic = -c_v) cannot reach it.
+        if self.readout.b_critic.grad is not None:
+            self.readout.b_critic.grad.zero_()
         self.stream_opt.step(delta, reset=done)
+
+        # ---- reward centering: b_critic tracks the mean return ----
+        # EMA of delta: _delta_ema -> 0 at the true value. Pull b_critic toward
+        # higher V when E[delta]>0 (V too low) and lower when E[delta]<0.
+        # Step ~ bias_centering_lr * delta_ema; the (1-gamma) factor matches the
+        # relationship between the average reward and the discounted value bias.
+        self._delta_ema = (cfg.bias_ema_decay * self._delta_ema
+                           + (1.0 - cfg.bias_ema_decay) * delta)
+        with torch.no_grad():
+            self.readout.b_critic.add_(self._bias_centering_lr * self._delta_ema)
 
         # ---- plasticity regen ----
         self.global_step += 1

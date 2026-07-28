@@ -53,8 +53,19 @@ class ObGD(torch.optim.Optimizer):
     """
     def __init__(self, params, lr: float = 1.0, gamma: float = 0.99,
                  lamda: float = 0.8, kappa: float = 2.0, weight_decay: float = 0.0):
+        # delta_cap (0 = off, stream-x default): when > 0, clamp the
+        # overshooting-normalizer d_bar = max(|delta|,1) to delta_cap for THIS
+        # group only. Below the cap: standard stream-x (constant-magnitude,
+        # safe step). Above the cap: the update grows linearly with |delta|,
+        # restoring e-prop's error-proportional kicks. Needed for the critic
+        # group because SEAL's value readout is LEAKY (e-prop Eq. 11, kappa=0.95
+        # -> ~20x gain, ~20-frame memory): it accumulates a DC bias that small
+        # constant-magnitude steps cannot flush. The terminal reward is the
+        # only signal large enough to clear it; delta_cap stops ObGD from
+        # normalizing that signal away. Actor/CNN leave delta_cap=0 (their
+        # heads are not leaky, so stream-x's bound is correct for them).
         defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa,
-                        weight_decay=weight_decay)
+                        weight_decay=weight_decay, delta_cap=0.0)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -81,8 +92,15 @@ class ObGD(torch.optim.Optimizer):
             z_sums.append(z_sum)
 
         # ---- 2) per-group overshooting-bounded step ----
-        d_bar = max(abs(delta), 1.0)
+        # d_bar is per-group: capped for groups with delta_cap>0 (critic),
+        # uncapped (pure stream-x) otherwise.
+        a_delta = abs(delta)
         for group, z_sum in zip(self.param_groups, z_sums):
+            cap = group.get("delta_cap", 0.0)
+            if cap > 0.0 and a_delta > cap:
+                d_bar = cap                       # above cap: update ~ |delta|/cap
+            else:
+                d_bar = max(a_delta, 1.0)          # standard stream-x
             M = d_bar * z_sum * group["lr"] * group["kappa"]
             step_size = group["lr"] / M if M > 1.0 else group["lr"]
             for p in group["params"]:

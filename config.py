@@ -139,7 +139,42 @@ class Config:
     # tag L1 is huge, so its normalized step is already ~1e-6 at κ_rec=2.
     kappa_rec: float = 2.0            # ObGD κ for the e-prop (Win/Wrec) update — do NOT lower
     kappa_policy: float = 20.0        # ObGD κ for the actor readout
-    kappa_value: float = 100.0        # ObGD κ for the critic (100: halved V bounce vs 50)
+    # Critic: Wout_critic is in ObGD; b_critic is NOT (see agent.py +
+    # bias_centering_lr below). Previously one shared group at κ=100: the
+    # 400 noisy zero-mean Wout traces drove ||e||_1~1540, shrinking the
+    # ObGD step to ~2.6e-6 for both, so b_critic needed ~4M steps to track
+    # the mean return, dominated V (V≈b_critic), starved Wout_critic
+    # (L2 0.95->0.12), and the critic collapsed to a constant V≈-3
+    # (verified on the ep2400 checkpoint: b_critic=-3.007, Wout_c L2=0.116).
+    # Even after splitting, b_critic under ObGD had no upward trend across
+    # seeds (per-step delta dominated by zero-mean Wout@LN(z) noise whose
+    # negative bias sinks it faster than terminal rewards lift it), so
+    # b_critic now uses reward centering (Naik et al. 2024) instead. kappa_value
+    # governs only Wout_critic; it starts small (readout.py init, L2~0.1)
+    # so V≈b_critic until the clean TD signal teaches it state-dependence.
+    kappa_value: float = 20.0         # ObGD κ for Wout_critic (the value weights)
+    # Reward centering for b_critic (Naik et al. 2024): the scalar value bias
+    # is NOT updated by ObGD (the per-step delta that drives Wout_critic is
+    # dominated by zero-mean noise from Wout_critic@LayerNorm(z) — spike rates
+    # mean-revert, giving delta a negative bias that sinks b_critic faster
+    # than terminal rewards lift it; verified: under ObGD alone b_critic
+    # oscillated around -3 with no upward trend). Instead b_critic tracks an
+    # EMA of the TD error: E[delta]->0 at the true value, so a persistent
+    # E[delta]>0 (V too low) pulls b_critic up. This decouples the bias
+    # (mean return) from the per-step value noise (state dependence).
+    bias_centering_lr: float = 0.05    # step size for b_critic <- b + lr*delta_ema
+    bias_ema_decay: float = 0.01      # EMA decay for delta (1/(1-decay) ~ 100 steps)
+    # delta_cap for the critic groups ONLY (0 = pure stream-x, off). Restores
+    # e-prop's error-proportional readout update ABOVE |delta|=cap while
+    # keeping stream-x's bounded constant-step below it. Even with
+    # kappa_critic=0 (memoryless V), a DC bias in b_critic can build up under
+    # ObGD's max(|delta|,1) normalization: terminal rewards (the only
+    # |delta|>1 events in sparse Pong) get normalized down to the same nudge
+    # as a trivial inter-step delta. Capping d_bar at 10 lets those rare large
+    # kicks grow ~linearly with |delta| (a |delta|=50 terminal surprise moves
+    # the critic ~5x more than a |delta|=10 one, instead of the same amount),
+    # so the bias drains fast. Actor/CNN stay uncapped.
+    critic_delta_cap: float = 10.0
     kappa_cnn: float = 5.0            # ObGD κ for the CNN front-end
     wd_policy: float = 1e-3           # weight decay, actor readout group
     wd_value: float = 1e-3            # weight decay, critic readout group
@@ -152,6 +187,18 @@ class Config:
     # softmax can never saturate one-hot and the policy channel of L_j can
     # never die (observed failure: entropy 0.00 for 50+ straight episodes).
     logit_cap: float = 2.0            # 0 disables
+    # Per-channel leak for the critic readout head. The actor stays leaky
+    # (e-prop Eq. 11, kappa=exp(-1/tau_out)=0.95). But a leaky critic is a
+    # ~1/(1-kappa)=20x-gain integrator that (a) amplifies any DC bias in
+    # Wout*z+b into a huge wrong V, and (b) traps that bias in state for
+    # ~20 frames so terminal-reward kicks can't flush it. Combined with
+    # ObGD's max(|delta|,1) normalization (which shrinks large kicks to a
+    # constant whisper), this drove a monotonic runaway: termV -50 -> -178
+    # over ~600 episodes. Setting kappa_critic=0 makes V = Wout*z + b
+    # memoryless, matching stream-x's value head (the architecture ObGD
+    # was designed for) and removing the 20x amplifier at its source.
+    # -1.0 = inherit kappa (legacy leaky-critic behavior, for ablation).
+    kappa_critic: float = 0.0
     # ScaleReward wrapper (stream-x): divide rewards by the running std of the
     # discounted return trace (floor 1.0). Shrinks the return magnitudes the
     # critic must represent -> δ becomes reward-dominated, not critic-noise-

@@ -283,6 +283,8 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
 def _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg, corrVr,
                running=False):
     tags = agent.tag_norms()
+    bc = float(agent.readout.b_critic.item())
+    wc_l2 = float(agent.readout.Wout_critic.norm().item())
     logger.log({
         "step": t, "episode": ep_idx,
         "return": round(ep_return, 3) if not running else "",
@@ -294,6 +296,8 @@ def _maybe_log(logger, t, ep_idx, ep_return, td_err, agent, cfg, corrVr,
         "tag_norm_win": round(tags[0], 4) if tags else 0.0,
         "tag_norm_wrec": round(tags[1], 4) if len(tags) > 1 else 0.0,
         "dormant_frac": round(agent.dormant_frac(), 4),
+        "b_critic": round(bc, 4),
+        "wout_critic_l2": round(wc_l2, 4),
         "max_episode_len": agent._current_max_len(),
     })
 
