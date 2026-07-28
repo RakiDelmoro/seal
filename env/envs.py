@@ -14,7 +14,7 @@ import gymnasium as gym
 
 from config import PRESETS, EnvPreset
 from env.envs_atari import NoopResetEnv, FireResetEnv, EpisodicLifeEnv
-from env.norm_wrappers import NormalizeObservation
+from env.norm_wrappers import NormalizeObservation, ScaleReward
 
 import ale_py
 gym.register_envs(ale_py)
@@ -34,12 +34,14 @@ class EnvSpec:
         self.dtype = dtype
 
 
-def _build_atari(preset: EnvPreset, seed: int, render: bool = False):
+def _build_atari(preset: EnvPreset, seed: int, render: bool = False,
+                 gamma: float = 0.99, scale_reward: bool = True):
     """ALE Pong pipeline:
     NoopReset -> MaxAndSkip(4) -> EpisodicLife -> FireReset
-    -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5).
-    No frame stacking — the recurrent LSNN core carries temporal context.
-    No reward scaling (Pong rewards are already ±1)."""
+    -> Resize(84) -> GrayScale -> NormalizeObservation(clip=5)
+    -> ScaleReward (optional; std of discounted return trace, floor 1.0).
+    No frame stacking — the recurrent LSNN core carries temporal context."""
+
     render_mode = "rgb_array" if render else None
     env = gym.make(preset.id, render_mode=render_mode)
     env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -52,13 +54,16 @@ def _build_atari(preset: EnvPreset, seed: int, render: bool = False):
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=True)
     env = NormalizeObservation(env, clip=5.0)
+    if scale_reward:
+        env = ScaleReward(env, gamma=gamma)
     obs, _ = env.reset(seed=seed)
     obs_chw = np.moveaxis(np.asarray(obs), -1, 0) if obs.ndim == 3 else obs
     spec = EnvSpec(preset, obs_chw.shape, env.action_space.n)
     return env, spec
 
 
-def make_env(env_id: str, seed: int = 0, render: bool = False):
+def make_env(env_id: str, seed: int = 0, render: bool = False,
+             gamma: float = 0.99, scale_reward: bool = True):
     """Build the wrapped env + EnvSpec for one preset id.
 
     render=True builds the env with render_mode='rgb_array' so a GUI can
@@ -66,7 +71,8 @@ def make_env(env_id: str, seed: int = 0, render: bool = False):
     """
     preset = PRESETS[env_id]
     if preset.domain == "atari":
-        env, spec = _build_atari(preset, seed, render=render)
+        env, spec = _build_atari(preset, seed, render=render, gamma=gamma,
+                                 scale_reward=scale_reward)
     else:
         raise ValueError(f"Unknown domain for env {env_id}: {preset.domain}")
     return env, spec

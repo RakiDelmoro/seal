@@ -40,13 +40,19 @@ class LeakyReadout(nn.Module):
         kappa: readout leak exp(-dt/τ_out)
     """
     def __init__(self, n_in: int, n_actor: int, n_critic: int = 1,
-                 kappa: float = 0.95):
+                 kappa: float = 0.95, logit_cap: float = 2.0):
         super().__init__()
         self.n_in = n_in
         self.n_actor = n_actor
         self.n_critic = n_critic
         self.n_out = n_actor + n_critic
         self.kappa = float(kappa)
+        # Structural entropy floor: actor logits = cap·tanh(y/cap), so the
+        # max logit gap is 2·cap = 4 and π_max ≈ 0.7–0.9 — softmax can never
+        # saturate to one-hot, so (π − 1_a) — the policy channel of L_j —
+        # can never die (observed failure: entropy = 0.00 for 50+ episodes).
+        # Critic value is NOT capped (must represent ±21). 0 disables.
+        self.logit_cap = float(logit_cap)
         # SEPARATE readout weights for actor and critic (paper Eq. 37).
         # This prevents the 6:1 actor:critic gradient ratio on a shared matrix
         # from drowning out the critic's value prediction.
@@ -108,7 +114,14 @@ class LeakyReadout(nn.Module):
         self._z_last = spike_rate.detach()
         self._y_prev = y_prev
         logits, value = self._split_y(y)
+        logits = self._cap(logits)
         return logits, value[self.n_critic - 1] if self.n_critic == 1 else value
+
+    def _cap(self, logits: torch.Tensor) -> torch.Tensor:
+        """Tanh cap on actor logits (structural entropy floor). 0 = off."""
+        if self.logit_cap > 0:
+            return self.logit_cap * torch.tanh(logits / self.logit_cap)
+        return logits
 
     def forward_from(self, y_prev: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """Recompute y = κ·y_prev + Wout·z + b WITHOUT mutating state.
@@ -120,4 +133,7 @@ class LeakyReadout(nn.Module):
         z = self._norm(z)   # same normalization as forward() — keep in sync
         i_a = F.linear(z.unsqueeze(0), self.Wout_actor, self.b_actor).squeeze(0)
         i_c = F.linear(z.unsqueeze(0), self.Wout_critic, self.b_critic).squeeze(0)
-        return self.kappa * y_prev + torch.cat([i_a, i_c])
+        y = self.kappa * y_prev + torch.cat([i_a, i_c])
+        # cap AFTER the κ-mixing, exactly as forward() does — act() and
+        # learn() must see ONE function
+        return torch.cat([self._cap(y[:self.n_actor]), y[self.n_actor:]])

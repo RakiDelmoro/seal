@@ -147,7 +147,7 @@ class Config:
     # tag L1 is huge, so its normalized step is already ~1e-6 at κ_rec=2.
     kappa_rec: float = 2.0            # ObGD κ for the e-prop (Win/Wrec) update — do NOT lower
     kappa_policy: float = 20.0        # ObGD κ for the actor readout
-    kappa_value: float = 50.0         # ObGD κ for the critic readout
+    kappa_value: float = 100.0        # ObGD κ for the critic (100: halved V bounce vs 50)
     kappa_cnn: float = 5.0            # ObGD κ for the CNN front-end
     wd_policy: float = 1e-3           # weight decay, actor readout group
     wd_value: float = 1e-3            # weight decay, critic readout group
@@ -156,6 +156,15 @@ class Config:
     # exploration from softmax sharpness — a collapsing policy entropy can
     # never kill exploration. 0 disables.
     explore_eps: float = 0.05
+    # Structural entropy floor: actor logits = logit_cap·tanh(y/logit_cap), so
+    # softmax can never saturate one-hot and the policy channel of L_j can
+    # never die (observed failure: entropy 0.00 for 50+ straight episodes).
+    logit_cap: float = 2.0            # 0 disables
+    # ScaleReward wrapper (stream-x): divide rewards by the running std of the
+    # discounted return trace (floor 1.0). Shrinks the return magnitudes the
+    # critic must represent -> δ becomes reward-dominated, not critic-noise-
+    # dominated (observed failure: V swinging ±40 on a ±21 game at 100k frames).
+    scale_reward: bool = True
     lam_rec: float = 1.0              # LSNN tag-filter λ (1.0 = paper's F_γ; <1 shortens credit window)
     grad_clip: float = 0.0            # legacy hard clip on |δ·tag| (0=off; ObGD supersedes)
 
@@ -172,9 +181,12 @@ class Config:
     eta_length_scale: bool = False   # legacy: scale η by 1/sqrt(len) — superseded by ObGD
 
     # ---- plasticity (dormant spiking-unit regeneration) ----
-    regen_every: int = 25_000
+    # Observed failure at 100k frames: dormant_frac climbing monotonically to
+    # 0.28 — death outran resurrection (4 neurons / 25k steps). Tuned to
+    # ~20 neurons / 10k steps.
+    regen_every: int = 10_000
     dormant_silence_ms: float = 10_000.0  # no spike for this many ms = dormant
-    regen_frac: float = 0.01
+    regen_frac: float = 0.05
 
     # ---- training / logging ----
     total_frames: int = 10_000_000

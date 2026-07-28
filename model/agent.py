@@ -64,7 +64,8 @@ class SEALAgent(nn.Module):
 
         # ---- readout (actor + critic) ----
         self.readout = LeakyReadout(cfg.n_lif + cfg.n_alif, n_actions,
-                                    n_critic=1, kappa=cfg.kappa)
+                                    n_critic=1, kappa=cfg.kappa,
+                                    logit_cap=cfg.logit_cap)
 
         # ---- symmetric e-prop feedback weights (B^π = Wout_actor^T, B^V = Wout_critic^T) ----
         # B is NOT a separate parameter; it is read live from the readout's

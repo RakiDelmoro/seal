@@ -38,7 +38,8 @@ CSV_COLUMNS = ["step", "episode", "return", "td_err", "v", "spike_rate_hz",
 def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
         ckpt_every_ep: int, ckpt_keep: int, quiet: bool, log_every_ep: int):
     torch.manual_seed(seed); np.random.seed(seed)
-    env, spec = make_env(cfg.env_id, seed=seed, render=gui)
+    env, spec = make_env(cfg.env_id, seed=seed, render=gui,
+                         gamma=cfg.gamma, scale_reward=cfg.scale_reward)
     agent = SEALAgent(cfg, n_actions=spec.n_actions, device="cpu")
     warmup(env, agent, n_frames=cfg.warmup_frames, seed=seed)
     agent.reset_after_warmup()
@@ -192,7 +193,7 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
                 ep_returns.append(ep_ret)
                 raw_ep_returns.append(raw_ep_ret)
                 v_at_ep.append(agent.last_v)
-                recent_ret.append(ep_ret); recent_v.append(agent.last_v)
+                recent_ret.append(raw_ep_ret); recent_v.append(agent.last_v)
                 # terminal-V convergence probe: V at the penultimate state
                 # should predict the terminal reward r.
                 recent_term_v.append(agent.last_v)
@@ -201,7 +202,7 @@ def run(cfg, seed: int, gui: bool, fps_cap: int, resume_path: str,
                     term_v_mean = float(np.mean(recent_term_v))
                     term_r_mean = float(np.mean(recent_term_r))
                 if len(ep_returns) >= 5 and len(v_at_ep) == len(ep_returns):
-                    arr_r = np.array(ep_returns[-50:])
+                    arr_r = np.array(raw_ep_returns[-50:])
                     arr_v = np.array(v_at_ep[-50:])
                     # Only trust corrVr when returns actually SPREAD — with
                     # near-constant returns (std ~0.2 in the all-losing regime)
