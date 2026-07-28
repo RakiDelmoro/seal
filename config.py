@@ -57,10 +57,10 @@ class Config:
     # the stream-x default). The LSNN e-prop tags use lam_rec below.
     lam: float = 0.8
     c_v: float = 1.0               # critic weight c_V in E = E_π + c_V·E_V
-    # Policy entropy bonus (optional regularizer; 0 disables).
-    # Raised from 0.01 to fight premature entropy collapse (policy narrowing
-    # to 2-3 actions without score improvement). Keeps the actor exploring.
-    entropy_coef: float = 0.05
+    # Policy entropy bonus, weighted by sign(δ) (stream-x form). Under ObGD's
+    # normalized updates the softmax drifts toward saturation; 0.2 (plus
+    # ε-greedy below) keeps behavior exploratory over long runs.
+    entropy_coef: float = 0.2
 
     # ---- value & TD-error clipping (0 = OFF; superseded by ObGD) ----
     # OFF by default. Rationale: (1) v_clip=10 < |true Pong return| = 21 makes
@@ -139,15 +139,18 @@ class Config:
     eta_cnn: float = 1.0              # base step size for CNN front-end (ObGD)
     # κ is THE effective step-size knob in ObGD's normalized regime (M>1):
     # update ≈ sign(δ)·e/(‖e‖₁·κ) — near-constant size, so weights random-walk
-    # with drift; small weight decay bounds ||W||. Paper values (3/2) oscillate
-    # on sparse-reward Pong with a linear readout; κ=10 + wd converges (critic
-    # termV → terminal reward within ~1k frames in smoke runs).
-    kappa_rec: float = 2.0            # ObGD κ for the e-prop (Win/Wrec) update
-    kappa_policy: float = 10.0        # ObGD κ for the actor readout
-    kappa_value: float = 10.0         # ObGD κ for the critic readout
+    # with drift; small weight decay bounds ||W||. Validated over 15k-frame
+    # runs: paper values (3/2) oscillate on sparse-reward Pong with a linear
+    # readout; κ_policy=20/κ_value=50 keeps the critic bounded near the
+    # terminal reward. κ_rec must stay GENTLE: κ_rec<=0.5 blew the recurrent
+    # core up (96% neurons dormant, |Win| 3x) within 15k frames — the LSNN
+    # tag L1 is huge, so its normalized step is already ~1e-6 at κ_rec=2.
+    kappa_rec: float = 2.0            # ObGD κ for the e-prop (Win/Wrec) update — do NOT lower
+    kappa_policy: float = 20.0        # ObGD κ for the actor readout
+    kappa_value: float = 50.0         # ObGD κ for the critic readout
     kappa_cnn: float = 5.0            # ObGD κ for the CNN front-end
     wd_policy: float = 1e-3           # weight decay, actor readout group
-    wd_value: float = 1e-4            # weight decay, critic readout group
+    wd_value: float = 1e-3            # weight decay, critic readout group
     wd_cnn: float = 1e-4              # weight decay, CNN front-end group
     # ε-greedy exploration (stream-x's validated Atari recipe): decouples
     # exploration from softmax sharpness — a collapsing policy entropy can

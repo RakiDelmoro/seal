@@ -397,9 +397,14 @@ def main():
                    help="checkpoint every N episodes (rotating ring)")
     p.add_argument("--ckpt-keep", type=int, default=5,
                    help="rotating checkpoints to keep (ring buffer)")
+    p.add_argument("--no-train-cnn", action="store_true",
+                   help="ablation: freeze the CNN front-end (frozen random encoder)")
     args = p.parse_args()
     cfg = config_from_preset(args.env, total_frames=args.frames,
-                             run_name=f"seal_eprop_s{args.seed}")
+                             run_name=f"seal_eprop_s{args.seed}"
+                                      + ("_frozencnn" if args.no_train_cnn else ""))
+    if args.no_train_cnn:
+        cfg.train_cnn = False
     run(cfg, seed=args.seed, gui=args.gui, fps_cap=args.fps,
         resume_path=args.resume, ckpt_every_ep=args.ckpt_every_ep,
         ckpt_keep=args.ckpt_keep, quiet=args.quiet, log_every_ep=args.log_every_ep)
