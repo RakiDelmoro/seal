@@ -131,27 +131,27 @@ class SEALAgent(nn.Module):
         self.last_v = 0.0
         self.last_entropy = 0.0
         self.last_spike_rate_hz = 0.0
-        # Reward centering for b_critic (Naik et al. 2024): the scalar value
-        # bias tracks the running mean return via an EMA of the TD error.
-        # E[delta] -> 0 when V equals the true value; a persistent E[delta]>0
-        # means V is too low and pulls b_critic up, E[delta]<0 pushes it down.
-        # This is DECOUPLED from the per-step delta that drives Wout_critic
-        # via ObGD: that per-step delta is dominated by zero-mean noise from
-        # Wout_critic@LayerNorm(z) (spike rates mean-revert), whose negative
-        # bias sinks b_critic faster than terminal rewards lift it (verified:
-        # under ObGD alone b_critic oscillated around -3 with no upward trend).
-        # The EMA averages out that noise, leaving the true mean-return signal.
-        self._delta_ema = 0.0
-        self._bias_centering_lr = cfg.bias_centering_lr
+        # b_critic is updated by PLAIN SGD on the value loss, NOT ObGD and NOT
+        # an EMA. Rationale (see agent.py stream_opt comment): the e-prop paper
+        # states that readout weights AND BIASES "do not require the theory of
+        # e-prop" and are trained by ordinary gradient descent (Supp. Note 3).
+        # b_critic is a single scalar; ObGD's overshooting bound (which uses the
+        # group L1 norm of eligibility traces) is designed for many-dimensional
+        # weight vectors that can overshoot, and coupling b_critic to the 400
+        # noisy Wout_critic traces in one ObGD group starved its step to ~2.6e-6
+        # (verified: b_critic collapsed to -3.0). Plain SGD on the value loss
+        # gives it the paper-faithful update: b <- b - eta_bias * dL_V/db, where
+        # L_V = -c_v * V (the delta-free critic loss; ObGD multiplies by delta
+        # downstream) => dL_V/db_critic = -c_v, so the update is
+        #   b_critic <- b_critic + eta_bias * c_v * delta
+        # i.e. it climbs when delta>0 (V too low) and descends when delta<0.
+        self._eta_bias = cfg.eta_bias
 
     # ----------------------------------------------------------- episode ctl
     def reset_episode(self):
         self.core.reset()
         self.readout.reset()
         self.eprop_opt.reset()
-        # NOTE: _delta_ema is NOT reset on episode boundary — it is a
-        # cross-episode running average of the TD error (the mean-return
-        # signal). Resetting it would discard the centering information.
 
     def warmup_forward(self, obs):
         """Run a forward pass without learning (normalize stats warmup)."""
@@ -304,22 +304,23 @@ class SEALAgent(nn.Module):
         total_loss = policy_loss + value_loss + cnn_loss
         self.stream_opt.zero_grad()
         total_loss.backward()
-        # b_critic must NOT receive an autograd gradient (it is updated by the
-        # reward-centering EMA below, not ObGD). Zero its grad before step so
-        # the value_loss = -c_v*V path (whose d/db_critic = -c_v) cannot reach it.
+        # b_critic must NOT receive an autograd gradient (it is updated by plain
+        # SGD below, not ObGD). Zero its grad before step so the value_loss =
+        # -c_v*V path (whose d/db_critic = -c_v) cannot reach it.
         if self.readout.b_critic.grad is not None:
             self.readout.b_critic.grad.zero_()
         self.stream_opt.step(delta, reset=done)
 
-        # ---- reward centering: b_critic tracks the mean return ----
-        # EMA of delta: _delta_ema -> 0 at the true value. Pull b_critic toward
-        # higher V when E[delta]>0 (V too low) and lower when E[delta]<0.
-        # Step ~ bias_centering_lr * delta_ema; the (1-gamma) factor matches the
-        # relationship between the average reward and the discounted value bias.
-        self._delta_ema = (cfg.bias_ema_decay * self._delta_ema
-                           + (1.0 - cfg.bias_ema_decay) * delta)
+        # ---- b_critic: plain SGD on the value loss (e-prop Supp. Note 3) ----
+        # The critic value loss is L_V = -c_v * V (delta-free; ObGD multiplies
+        # by delta for the Wout_critic path). dL_V/db_critic = -c_v, so a
+        # gradient-DESCENT step is  b <- b - eta * (-c_v) * delta_scaling.
+        # We use the raw delta directly (as the paper's GD does): a positive
+        # delta (V underestimated) pushes b up toward the true mean return; a
+        # negative delta pushes it down. This decouples the scalar bias from
+        # the per-step Wout_critic noise that starved it under ObGD.
         with torch.no_grad():
-            self.readout.b_critic.add_(self._bias_centering_lr * self._delta_ema)
+            self.readout.b_critic.add_(self._eta_bias * cfg.c_v * delta)
 
         # ---- plasticity regen ----
         self.global_step += 1

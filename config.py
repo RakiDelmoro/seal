@@ -139,31 +139,28 @@ class Config:
     # tag L1 is huge, so its normalized step is already ~1e-6 at κ_rec=2.
     kappa_rec: float = 2.0            # ObGD κ for the e-prop (Win/Wrec) update — do NOT lower
     kappa_policy: float = 20.0        # ObGD κ for the actor readout
-    # Critic: Wout_critic is in ObGD; b_critic is NOT (see agent.py +
-    # bias_centering_lr below). Previously one shared group at κ=100: the
-    # 400 noisy zero-mean Wout traces drove ||e||_1~1540, shrinking the
-    # ObGD step to ~2.6e-6 for both, so b_critic needed ~4M steps to track
-    # the mean return, dominated V (V≈b_critic), starved Wout_critic
-    # (L2 0.95->0.12), and the critic collapsed to a constant V≈-3
-    # (verified on the ep2400 checkpoint: b_critic=-3.007, Wout_c L2=0.116).
-    # Even after splitting, b_critic under ObGD had no upward trend across
-    # seeds (per-step delta dominated by zero-mean Wout@LN(z) noise whose
-    # negative bias sinks it faster than terminal rewards lift it), so
-    # b_critic now uses reward centering (Naik et al. 2024) instead. kappa_value
-    # governs only Wout_critic; it starts small (readout.py init, L2~0.1)
-    # so V≈b_critic until the clean TD signal teaches it state-dependence.
+    # Critic: Wout_critic is in ObGD; b_critic is NOT. Previously one shared
+    # group at κ=100: the 400 noisy zero-mean Wout traces drove ||e||_1~1540,
+    # shrinking the ObGD step to ~2.6e-6 for both, so b_critic needed ~4M
+    # steps to track the mean return, dominated V (V≈b_critic), starved
+    # Wout_critic (L2 0.95->0.12), and the critic collapsed to a constant
+    # V≈-3 (verified on the ep2400 checkpoint: b_critic=-3.007,
+    # Wout_c L2=0.116). The e-prop paper states readout weights AND BIASES
+    # "do not require the theory of e-prop" (Supp. Note 3) and trains the
+    # bias b_out by ordinary gradient descent; we follow that: b_critic gets
+    # plain SGD on the value loss (see agent.py), b <- b + eta_bias*c_v*delta.
+    # This is paper-faithful and decouples the scalar from ObGD's group L1
+    # coupling. kappa_value governs only Wout_critic; it starts small
+    # (readout.py init, L2~0.1) so V≈b_critic until the clean TD signal
+    # teaches it state-dependence.
     kappa_value: float = 20.0         # ObGD κ for Wout_critic (the value weights)
-    # Reward centering for b_critic (Naik et al. 2024): the scalar value bias
-    # is NOT updated by ObGD (the per-step delta that drives Wout_critic is
-    # dominated by zero-mean noise from Wout_critic@LayerNorm(z) — spike rates
-    # mean-revert, giving delta a negative bias that sinks b_critic faster
-    # than terminal rewards lift it; verified: under ObGD alone b_critic
-    # oscillated around -3 with no upward trend). Instead b_critic tracks an
-    # EMA of the TD error: E[delta]->0 at the true value, so a persistent
-    # E[delta]>0 (V too low) pulls b_critic up. This decouples the bias
-    # (mean return) from the per-step value noise (state dependence).
-    bias_centering_lr: float = 0.05    # step size for b_critic <- b + lr*delta_ema
-    bias_ema_decay: float = 0.01      # EMA decay for delta (1/(1-decay) ~ 100 steps)
+    # Plain-SGD learning rate for b_critic (e-prop Supp. Note 3 method).
+    # Update: b_critic <- b_critic + eta_bias * c_v * delta. Sized so that
+    # with ~1 terminal (delta~+2.6) and ~190 non-terminal (delta~+0.03)
+    # steps per episode, b_critic climbs ~0.04/episode -> fixes a -3->-0.37
+    # gap in ~75 episodes (~15k frames, <2% of the run), fast enough to
+    # track the mean return, slow enough not to oscillate.
+    eta_bias: float = 0.005
     # delta_cap for the critic groups ONLY (0 = pure stream-x, off). Restores
     # e-prop's error-proportional readout update ABOVE |delta|=cap while
     # keeping stream-x's bounded constant-step below it. Even with
