@@ -58,7 +58,7 @@ class FireResetEnv(gym.Wrapper):
 class EpisodicLifeEnv(gym.Wrapper):
     """End episode (report done) when a life is lost; reset on true done.
 
-    This interacts with SEAL's step loop: caches + eligibility traces reset on
+    This interacts with SEAL's step loop: caches reset on
     `done` (spec §2.8). With episodic_life=True, that happens on each life loss
     (~5x per Pong episode). Toggle via config.episodic_life (D3).
     """
