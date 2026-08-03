@@ -3,11 +3,10 @@
 Logs one row per episode with:
   phase, episode, step_count, episode_reward, episode_length,
   scored, lost, epsilon, a_op_norm, pred_err_avg,
-  d_norm, rollout_norm_ratio
+  d_norm, rollout_norm_ratio, score_std, v_norm, pi_norm, td_delta_avg,
+  source_epsilon, source_policy, source_imagination, source_no_goal, source_random
 
-There is no v_norm, pi_norm, last_td_error, or b_norm column — there is no
-learned value function, policy, or bias in this architecture. The CSV is flushed after every
-write so it's safe to monitor with `tail -f` or read mid-training.
+The CSV is flushed after every write so it's safe to monitor with `tail -f`.
 """
 from __future__ import annotations
 import os
@@ -21,7 +20,9 @@ CSV_FIELDS = [
     "timestamp", "phase", "episode", "step_count",
     "episode_reward", "episode_length", "scored", "lost",
     "epsilon", "a_op_norm", "pred_err_avg",
-    "d_norm", "rollout_norm_ratio",
+    "d_norm", "rollout_norm_ratio", "score_std",
+    "v_norm", "pi_norm", "td_delta_avg",
+    "src_epsilon", "src_policy", "src_imagination", "src_no_goal", "src_random",
 ]
 
 
@@ -46,7 +47,8 @@ class MetricsLogger:
     def log_episode(self, phase: str, episode: int, core: SEALCore,
                     episode_reward: float, episode_length: int,
                     scored: int, lost: int, epsilon: float,
-                    pred_err_avg: float):
+                    pred_err_avg: float, score_std: float = 0.0,
+                    td_delta_avg: float = 0.0, engine=None):
         """Log one row of metrics."""
         self._ensure_open()
         diag = core.diagnostics()
@@ -55,6 +57,8 @@ class MetricsLogger:
         if len(core.recent_states) > 0:
             s0 = list(core.recent_states)[-1]
             rollout_ratio = core._rollout_norm_ratio(s0, horizon=5)
+
+        src = engine.source_counts() if engine else {}
 
         row = {
             "timestamp": f"{time.time():.0f}",
@@ -70,6 +74,15 @@ class MetricsLogger:
             "pred_err_avg": f"{pred_err_avg:.4f}",
             "d_norm": f"{diag['d_norm']:.4f}",
             "rollout_norm_ratio": f"{rollout_ratio:.4f}",
+            "score_std": f"{score_std:.4f}",
+            "v_norm": f"{diag['v_norm']:.4f}",
+            "pi_norm": f"{diag['pi_norm']:.4f}",
+            "td_delta_avg": f"{td_delta_avg:.4f}",
+            "src_epsilon": src.get("epsilon", 0),
+            "src_policy": src.get("policy", 0),
+            "src_imagination": src.get("imagination", 0),
+            "src_no_goal": src.get("no_goal", 0),
+            "src_random": src.get("random", 0),
         }
         self._writer.writerow(row)
         self._file.flush()

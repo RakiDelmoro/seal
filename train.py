@@ -1,13 +1,16 @@
 """SEAL — main training entry point.
 
-SEAL learns and acts from frame 1. Action selection is two gates:
+SEAL learns and acts from frame 1. Action selection is three gates:
   - Gate 1: ε-random (adaptive from the game's ±1 reward — losing → explore more)
-  - Gate 2: geometric goal exists? → imagination (40 rollouts toward s*)
+  - Gate 2: π confident? → policy action (System 1)
+            (20% force-imagination override keeps teaching π)
+  - Gate 3: geometric goal exists? → imagination (40 rollouts toward s*)
             else → random
 
-Only the transition model (A, B, b) and the inverse model (D) learn, both
-from self-supervised prediction error every frame. No learned value function,
-no learned policy, no eligibility traces, no TD.
+The transition model (A, B) and inverse model (D) learn from self-supervised
+prediction error every frame. The value function V and policy π learn from the
+sparse game reward via per-step streaming TD(λ) — one transition in, one
+update out, no episode buffering, no Monte Carlo fallback.
 
 Features for long runs:
   --frame-budget N         : run until N total frames are processed
@@ -92,20 +95,21 @@ def train(n_episodes: int = 100, seed: int = 0,
         scored = lost = 0
         done = False
         pred_err_sum = 0.0
+        td_delta_sum = 0.0
 
         while not done and total_frames < frame_budget:
             # Unified action selection (gates 1-3 inside the engine)
             action, diag = engine.select_action(s, core, tracker)
-            from_imagination = diag["source"] in ("greedy", "top5")
+            source = diag["source"]
 
             nf, r, term, trunc, _ = env.step(action)
             done = term or trunc
             s_next = pipe.forward(nf)[0]
 
             # Online learning (all components, every frame)
-            m = core.step_learn(s, action, s_next, r, done,
-                                learned_from_imagination=from_imagination)
+            m = core.step_learn(s, action, s_next, r, done, source=source)
             pred_err_sum += m["pred_err_norm"]
+            td_delta_sum += m["td_delta"]
             ep_reward += r
             ep_len += 1
             total_frames += 1
@@ -115,17 +119,25 @@ def train(n_episodes: int = 100, seed: int = 0,
 
         tracker.on_episode_end(scored, lost)
         diag = core.diagnostics()
+        score_stats = engine.last_score_stats()
 
         if logger:
             logger.log_episode("train", ep, core, ep_reward, ep_len,
                                scored, lost, tracker.epsilon(),
-                               pred_err_sum / max(ep_len, 1))
+                               pred_err_sum / max(ep_len, 1),
+                               score_stats["score_std"],
+                               td_delta_sum / max(ep_len, 1),
+                               engine)
 
         if verbose and (ep % 5 == 0 or ep == start_episodes):
             print(f"  [ep {ep:3d}] frames={total_frames:6d} "
                   f"len={ep_len:4d} R={ep_reward:+5.1f} ({scored}-{lost}) "
                   f"ε={tracker.epsilon():.3f} "
                   f"‖A‖op={diag['a_op_norm']:.3f} D={diag['d_norm']:.2f} "
+                  f"V={diag['v_norm']:.2f} π={diag['pi_norm']:.2f} "
+                  f"td={m.get('td_delta', 0.0):+.3f} "
+                  f"score_std={score_stats['score_std']:.2f} "
+                  f"pre={diag['n_pre_score_states']} "
                   f"src={engine.source_counts()}",
                   flush=True)
 

@@ -39,24 +39,25 @@ class Direction:
     def update(self, action_onehot: np.ndarray, delta_s: np.ndarray, eta: float):
         """Error-driven inverse model (self-limiting).
 
-        Predict the action from the observed state change, and descend the
+        Predict the action from a state-change vector, and descend the
         cross-entropy between the predicted action distribution and the action
         actually taken:
 
           ΔD = η · (a_onehot − softmax(D·Δs)) ⊗ Δs / (‖Δs‖² + ε)
 
+        In SEAL we pass the prediction residual (s_{t+1} − ŝ_{t+1}) as Δs,
+        because the residual is dominated by the action effect. D therefore
+        learns to map "the action-induced part of the world change" onto the
+        action, which is exactly the mapping needed for planning.
+
         When D·Δs correctly predicts the action, softmax → a_onehot and the
-        error → 0, so D stops growing — unlike the pure Hebbian rule, which
-        adds ~η in a correlated direction every frame and diverges (observed:
-        ‖D‖ 0.55 → 59 over 1620 episodes). This replaces the paper's
-        `min(W, 1)` saturation (eq 21), which assumes nonneg grid-cell states
-        and does not apply to Pong's signed Gabor features.
+        error → 0, so D stops growing.
         """
         u = self.D @ delta_s               # (n_actions,) — predicted utilities
         u = u - u.max()                    # softmax (numerically stable)
         probs = np.exp(u)
         probs = probs / probs.sum()
-        norm_sq = float(delta_s @ delta_s) + 1e-6
+        norm_sq = max(float(delta_s @ delta_s), 1.0)  # prevent zero-state explosion
         grad = np.outer(action_onehot - probs, delta_s)   # (n_actions, n_state)
         self.D += eta * grad / norm_sq
 

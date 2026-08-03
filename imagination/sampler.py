@@ -46,6 +46,13 @@ def sample_trajectories(s_0: np.ndarray, s_star: np.ndarray | None,
 
     # Initialize batch: all trajectories start from s_0
     S = np.tile(s_0, (K, 1))   # (K, N)
+    # Target norm: keep rollouts at the real state's magnitude so the
+    # geometric scorer can compare them to the full-size goal s*. Without this,
+    # A (a shrinkage operator, ‖A‖_op≈0.96) shrinks 5-step rollouts to ~25% of
+    # their starting norm — making all 40 futures look equally far from the
+    # goal regardless of their direction. The rollouts are accurate and
+    # diverse (measured); renormalizing preserves that good information.
+    target_norm = float(np.linalg.norm(s_0)) + 1e-8
 
     # Per-trajectory storage: first action + full predicted-state trajectory
     # (the evaluator scores these geometrically against s*).
@@ -81,8 +88,13 @@ def sample_trajectories(s_0: np.ndarray, s_star: np.ndarray | None,
         a_onehot = np.zeros((K, N_ACTIONS), dtype=np.float32)
         a_onehot[np.arange(K), actions] = 1.0
 
-        # Predict next state (batched): ŝ = A·ŝ + B·a + b
+        # Predict next state (batched): ŝ = A·ŝ + B·a
         S = dynamics.predict_batch(S, a_onehot, B_mat)  # (K, N)
+        # Renormalize: keep each rollout at the real state's magnitude so the
+        # geometric scorer isn't dominated by shrinkage. (Fixes the measured
+        # rollout_norm_ratio collapse to 0.25 — the diagnosed bottleneck.)
+        norms = np.linalg.norm(S, axis=1, keepdims=True) + 1e-8
+        S = S * (target_norm / norms)
         all_states[:, step, :] = S
 
     # Convert to list of dicts. `states` holds the predicted trajectory so the

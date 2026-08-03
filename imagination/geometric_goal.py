@@ -77,14 +77,26 @@ class GeometricGoal:
             return None
         return peak % self.grid               # px = col
 
-    # ── Goal selection: s* = recent state with ball most on opponent side ──
-    def select_goal(self, recent_states) -> np.ndarray | None:
-        """s* = the recent observed state with the highest ball px (vectorized).
+    # ── Goal selection: s* = proven goal (pre-score) or geometric proxy ──
+    def select_goal(self, recent_states, pre_score_states=None) -> np.ndarray | None:
+        """s* = the goal to aim imagination toward.
 
-        Scans the rolling window of recent states, localizes the ball in each,
-        and returns the state where the ball is furthest on the opponent's
-        side (highest px). Requires at least 10 states with visible motion.
+        Preference order:
+          1. Pre-score states (if any): states that preceded an actual +1.
+             These are *proven* goal states — they led to scoring. Pick the
+             most recent one (the ball/paddle config that just worked).
+          2. Geometric proxy (fallback): the recent state with the highest
+             ball px ("ball on the opponent's side"). Used during cold start
+             before any +1 has occurred.
+
+        The +1 reward is used here as a GOAL LABEL ("this state scored → aim
+        there"), not as a learning signal — no weights are updated from it.
         """
+        # 1. Prefer proven goal states (from actual +1s)
+        if pre_score_states is not None and len(pre_score_states) > 0:
+            return np.asarray(list(pre_score_states)[-1], dtype=np.float32).copy()
+
+        # 2. Fallback: geometric proxy (ball most on opponent side)
         states = [np.asarray(s, dtype=np.float32) for s in recent_states]
         if len(states) < 10:
             return None

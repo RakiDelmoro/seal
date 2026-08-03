@@ -197,49 +197,94 @@ seal/
 ### Prerequisites
 
 ```
-numpy, scipy, gymnasium, ale-py, pytest
+numpy, scipy, gymnasium, ale-py, torch, pygame, pytest
 ```
 
-### Run training
+### Run training (headless, no GUI)
+
+The standard way to train — runs as fast as possible with no display, logs
+per-episode metrics to a CSV, and saves checkpoints periodically.
 
 ```bash
 # Short run (episode-count mode)
 python train.py --episodes 100 --seed 0
 
 # Long run (frame-budget mode, with checkpointing + logging)
-python train.py --frame-budget 1000000 --checkpoint-interval 50000 \
-  --log-path results/seal_v4_1m.csv --seed 0
+python train.py --frame-budget 10000000 --seed 0 \
+  --log-path results/seal.csv \
+  --checkpoint-interval 500000 --checkpoint-dir results
 
-# Resume from a checkpoint
-python train.py --resume results/seal_final_100k.npz \
-  --frame-budget 500000 --checkpoint-interval 50000 --seed 0
+# Resume training from a checkpoint (keeps the learned world model + direction)
+python train.py --resume results/seal_final_7006k.npz \
+  --frame-budget 10000000 --seed 999 \
+  --log-path results/seal.csv \
+  --checkpoint-interval 500000 --checkpoint-dir results
 ```
 
-### Monitor progress
+Checkpoints are saved to `results/seal_<frames>k.npz` (e.g. `seal_500000k.npz`)
+and the latest as `results/seal_final_<frames>k.npz`. Resume picks up from the
+latest without losing work.
+
+### Monitor progress (headless)
 
 ```bash
-tail -f results/seal_v4_1m.csv
+tail -f results/seal.csv
 ```
 
 Key columns to watch:
 - `scored`, `lost` — game score
-- `pi_confidence` — policy's agreement with imagination (grows over time)
-- `pi_norm`, `v_norm` — policy and value are learning
-- `v_variance_signal` — value function has signal (phase gate threshold: 0.05)
+- `epsilon` — exploration rate (drops as the success rate rises → the flywheel)
+- `pred_err_avg` — world-model prediction error (should trend down)
+- `d_norm` — direction model norm (stays bounded, no divergence)
+- `rollout_norm_ratio` — 5-step rollout shrinkage (A-only; the sampler
+  renormalizes, so this is a diagnostic, not the planning norm)
+- `score_std` — spread of the 40 imagination scores (high = diverse plans)
+
+### Visualize with the GUI (pygame)
+
+Watch the trained agent play Pong in a live pygame window. Great for seeing
+what the agent actually does — how it positions the paddle, when imagination
+fires vs random exploration, and whether its plans look sensible.
+
+```bash
+# Watch only (evaluation, no learning) — the cleanest view of current behavior
+python play_gui.py --checkpoint results/seal_final_7006k.npz --fps 60
+
+# Watch AND keep learning (training continues while you watch)
+python play_gui.py --checkpoint results/seal_final_7006k.npz --learn --frames 200000 --fps 60
+
+# Slow it down to watch closely
+python play_gui.py --checkpoint results/seal_final_7006k.npz --fps 15
+
+# Resume from a specific checkpoint and watch + learn
+python play_gui.py --checkpoint results/seal_5000k.npz --learn --fps 60
+```
+
+The window shows the raw Pong screen (scaled up) with a HUD overlay:
+```
+ep 3  fr 540  score +1  src    greedy  eps 0.29  learn False
+```
+- `src` = which gate produced the action: `greedy`/`top5` = imagination,
+  `epsilon` = random exploration, `no_goal` = no goal available yet
+- `learn` = whether weights are updating (toggle with **L**)
+
+Controls:
+- **ESC** or close window: quit
+- **P**: pause/resume
+- **L**: toggle learning on/off during play
 
 ### Run tests
 
 ```bash
-python -m pytest perception/tests/ -v          # Slice 0: perception + moving-dot gate
-python -m pytest tests/test_slice1_pong.py -v  # Slice 1: Pong integration
-python -m pytest tests/test_slice2_imagination.py -v  # Slice 2: imagination + pipeline
+python -m pytest tests/test_slice2_imagination.py -v          # integration tests
+python -m pytest tests/test_slice2_imagination.py -k "not smoke" -q  # fast unit tests only
 ```
 
-### Evaluate a trained model
+### Evaluate a trained model (headless)
 
 ```bash
 # From a checkpoint
-python test.py --checkpoint results/seal_final_100k.npz --eval-episodes 20
+python test.py --checkpoint results/seal_final_7006k.npz --eval-episodes 20
 
 # Or quick train-then-eval
 python test.py --train-episodes 50 --eval-episodes 20 --seed 0

@@ -97,11 +97,11 @@ def test_engine_random_when_no_goal():
     assert diag["source"] == "no_goal"
 
 
-def test_no_learned_value_or_policy():
-    """The core has no value function or policy — only A, B, D."""
+def test_has_value_and_policy():
+    """The core now has the OaK value and policy components."""
     core = SEALCore()
-    assert not hasattr(core, "value")
-    assert not hasattr(core, "policy")
+    assert hasattr(core, "value")
+    assert hasattr(core, "policy")
     assert hasattr(core, "dynamics")
     assert hasattr(core, "action_effect")
     assert hasattr(core, "direction")
@@ -118,16 +118,19 @@ def trained_core():
 
 
 def test_smoke_learns_and_stays_bounded(trained_core):
-    """After a short real-Pong run, D is bounded and A stable."""
+    """After a short real-Pong run, all components are bounded and A stable."""
     diag = trained_core.diagnostics()
     print(f"\n  After 5 episodes: d_norm={diag['d_norm']:.3f}, "
-          f"a_op_norm={diag['a_op_norm']:.4f}, steps={diag['step_count']}")
+          f"a_op_norm={diag['a_op_norm']:.4f}, v_norm={diag['v_norm']:.3f}, "
+          f"pi_norm={diag['pi_norm']:.3f}, steps={diag['step_count']}")
     assert diag["d_norm"] < 10.0
+    assert diag["v_norm"] < 100.0
+    assert diag["pi_norm"] < 100.0
     assert 0.9 < diag["a_op_norm"] < 1.1
 
 
 def test_checkpoint_roundtrips_weights():
-    """Checkpoint save/load persists A, B, D."""
+    """Checkpoint save/load persists A, B, D, V, π."""
     import tempfile, os
     from utils.checkpoint import save_checkpoint, load_checkpoint
     core = SEALCore()
@@ -138,4 +141,6 @@ def test_checkpoint_roundtrips_weights():
     assert int(meta["episodes"]) == 5
     assert core2.step_count == 42
     assert np.allclose(core2.dynamics.A_band, core.dynamics.A_band)
+    assert np.allclose(core2.value.w, core.value.w)
+    assert np.allclose(core2.policy.theta, core.policy.theta)
     os.remove(tmp)

@@ -167,7 +167,7 @@ class BandedDynamics:
         norm (Pong ‖s‖²≈324; without it η_a=5e-4 gives effective rate 0.16,
         which is aggressive and fights the spectral clip).
         """
-        norm_sq = float(s_t @ s_t) + 1e-6
+        norm_sq = max(float(s_t @ s_t), 1.0)  # prevent zero-state explosion
         scale_a = eta_a / norm_sq
 
         # Banded A update

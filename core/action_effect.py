@@ -3,18 +3,22 @@
 Part of the affine transition model:
   s_{t+1} = A·s_t + B·a_t + b
 
-B ∈ ℝ^{N×A}  (1000×3). Each column is the state-space displacement caused
-by one action (NOOP, UP, DOWN). The paddle's movement produces a consistent
-translating signature in the state space, so this is the easiest component
-to learn.
+B ∈ ℝ^{N×A}. Each column is the state-space displacement caused by one action
+(NOOP, UP, DOWN). The paddle's movement produces a consistent translating
+signature in the state space, so this is the easiest component to learn.
 
-Learning (delta rule):
-  ΔB = η_B · err · a_t^T     where err = s_{t+1} - predicted_s
+Learning (normalized delta rule):
+  ΔB = η_B · err · a_t^T / (‖s_t‖² + ε)
+
+Normalizing by the state norm prevents B from absorbing large ball-motion
+prediction errors. Weight decay keeps B bounded.
 """
 from __future__ import annotations
 import numpy as np
 
-from config import N_STATE, N_ACTIONS, B_INIT_STD, B_SEED
+from config import (
+    N_STATE, N_ACTIONS, B_INIT_STD, B_SEED, B_WEIGHT_DECAY, B_NORM_UPDATE,
+)
 
 
 class ActionEffect:
@@ -31,6 +35,13 @@ class ActionEffect:
         """B @ a — the state change caused by this action."""
         return self.B @ action_onehot
 
-    def update(self, err: np.ndarray, action_onehot: np.ndarray, eta: float):
-        """ΔB = η · err · a^T  (outer product of error with action)."""
-        self.B += eta * np.outer(err, action_onehot)
+    def update(self, err: np.ndarray, action_onehot: np.ndarray, eta: float,
+               s_t: np.ndarray | None = None):
+        """ΔB = η · err · a^T / (‖s_t‖² + ε) with optional weight decay."""
+        scale = 1.0
+        if B_NORM_UPDATE and s_t is not None:
+            norm_sq = max(float(s_t @ s_t), 1.0)  # prevent zero-state explosion
+            scale = 1.0 / norm_sq
+        self.B += eta * scale * np.outer(err, action_onehot)
+        if B_WEIGHT_DECAY > 0:
+            self.B *= (1.0 - B_WEIGHT_DECAY)
