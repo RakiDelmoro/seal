@@ -61,8 +61,10 @@ class ImaginationEngine:
         self._value_window = 100
         self._v_signal_threshold = 0.01
 
-    def _v_has_signal(self) -> bool:
-        """True if V distinguishes states (std over recent window > threshold)."""
+    def _v_has_signal(self, core) -> bool:
+        """True if the SCORING value distinguishes states (std over recent
+        window > threshold). Uses core.scorer_value() so it measures V_sf
+        when SF is enabled."""
         # Keep only the most recent values to avoid unbounded growth
         if len(self._recent_values) > self._value_window * 2:
             self._recent_values = self._recent_values[-self._value_window:]
@@ -113,7 +115,7 @@ class ImaginationEngine:
 
         if s_star is not None:
             # Temporarily disable value-based scoring if V has no signal yet.
-            v_signal = self._v_has_signal()
+            v_signal = self._v_has_signal(core)
             if not v_signal:
                 self.scorer.alpha = 0.0
 
@@ -125,7 +127,7 @@ class ImaginationEngine:
                 rng=self.rng,
             )
             scores, best_idx = self.scorer.score_trajectories(
-                trajectories, value=core.value, s_star=s_star,
+                trajectories, value=core.scorer_value(), s_star=s_star,
                 danger_penalty=DANGER_PENALTY)
             self.last_scores = scores
             self.last_best_idx = best_idx
@@ -142,7 +144,7 @@ class ImaginationEngine:
 
             self._source_counts["imagination"] += 1
             if v_signal:
-                self._recent_values.append(core.value.forward(s_t))
+                self._recent_values.append(core.scorer_value().forward(s_t))
                 self.scorer.grow_alpha(1)
             return action, {
                 "action": action,

@@ -4,7 +4,8 @@ Logs one row per episode with:
   phase, episode, step_count, episode_reward, episode_length,
   scored, lost, epsilon, a_op_norm, pred_err_avg,
   d_norm, rollout_norm_ratio, score_std, v_norm, pi_norm, td_delta_avg,
-  source_epsilon, source_policy, source_imagination, source_no_goal, source_random
+  r_norm, r_err_avg,
+  src_epsilon, src_policy, src_imagination, src_no_goal, src_random
 
 The CSV is flushed after every write so it's safe to monitor with `tail -f`.
 """
@@ -12,7 +13,6 @@ from __future__ import annotations
 import os
 import csv
 import time
-import numpy as np
 
 from core.seal_core import SEALCore
 
@@ -21,7 +21,9 @@ CSV_FIELDS = [
     "episode_reward", "episode_length", "scored", "lost",
     "epsilon", "a_op_norm", "pred_err_avg",
     "d_norm", "rollout_norm_ratio", "score_std",
-    "v_norm", "pi_norm", "td_delta_avg",
+    "v_norm", "pi_norm", "td_delta_avg", "rho",
+    "sf_norm", "sf_rho",
+    "r_norm", "r_err_avg",
     "src_epsilon", "src_policy", "src_imagination", "src_no_goal", "src_random",
 ]
 
@@ -48,7 +50,8 @@ class MetricsLogger:
                     episode_reward: float, episode_length: int,
                     scored: int, lost: int, epsilon: float,
                     pred_err_avg: float, score_std: float = 0.0,
-                    td_delta_avg: float = 0.0, engine=None):
+                    td_delta_avg: float = 0.0, r_err_avg: float = 0.0,
+                    engine=None):
         """Log one row of metrics."""
         self._ensure_open()
         diag = core.diagnostics()
@@ -78,6 +81,11 @@ class MetricsLogger:
             "v_norm": f"{diag['v_norm']:.4f}",
             "pi_norm": f"{diag['pi_norm']:.4f}",
             "td_delta_avg": f"{td_delta_avg:.4f}",
+            "r_norm": f"{diag['r_norm']:.4f}",
+            "rho": f"{diag['v_rho']:.6f}",
+            "sf_norm": f"{diag['sf_norm']:.4f}",
+            "sf_rho": f"{diag['sf_rho']:.6f}",
+            "r_err_avg": f"{r_err_avg:.4f}",
             "src_epsilon": src.get("epsilon", 0),
             "src_policy": src.get("policy", 0),
             "src_imagination": src.get("imagination", 0),

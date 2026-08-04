@@ -9,8 +9,8 @@ A model that's losing explores more; a model that's winning trusts its
 imagination. ε never drops below the floor (always keep seeing novel states
 for online learning).
 
-Used in Phase 2 (imaginative play); built here so the tracker accumulates
-from the start.
+The engine queries it at every action-selection step; ε falls as the agent
+starts winning.
 """
 from __future__ import annotations
 from collections import deque

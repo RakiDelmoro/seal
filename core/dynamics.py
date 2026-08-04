@@ -66,46 +66,52 @@ class BandedDynamics:
         # futures drift to the same default state → indistinguishable →
         # scoring flatlines). The paper's forward model ŝ = s + V·a has no
         # bias for the same reason.
+
+        # ── Precomputed band geometry (for vectorized build/update) ──
+        # cols[i, j] = i + offset_j (clipped); valid[i, j] marks in-band
+        # entries. Entry A[i, cols[i,j]] == A_band[i, j] when valid.
+        cols_raw = np.arange(n_state)[:, None] + self.band_offsets[None, :]
+        self._valid = (cols_raw >= 0) & (cols_raw < n_state)       # (N, K)
+        self._cols = np.clip(cols_raw, 0, n_state - 1).astype(np.intp)
+        flat_valid = self._valid.ravel()
+        self._scatter_rows = np.repeat(np.arange(n_state), self.K)[flat_valid]
+        self._scatter_cols = self._cols[self._valid]
+        self._flat_valid = flat_valid
+
         self._update_count = 0
         self._dense_A_dirty = True
         self._dense_A = None
 
     # ── Forward: A @ s ─────────────────────────────────────────────
     def forward(self, s: np.ndarray) -> np.ndarray:
-        """Compute A @ s for a single state vector using banded structure."""
-        result = np.zeros(self.N, dtype=np.float32)
-        for j, offset in enumerate(self.band_offsets):
-            if offset == 0:
-                result += self.A_band[:, j] * s
-            elif offset > 0:
-                result[:-offset] += self.A_band[:-offset, j] * s[offset:]
-            else:  # offset < 0
-                result[-offset:] += self.A_band[-offset:, j] * s[:self.N + offset]
-        return result
+        """Compute A @ s for a single state vector (dense BLAS matvec).
+
+        Uses the cached dense A (rebuilt only when weights change). The old
+        321-offset Python loop cost ~3.1 ms/call; the BLAS matvec costs
+        ~0.5 ms. Mathematically identical (A is zero outside the band);
+        float32 summation order differs by ~1e-6.
+        """
+        if self._dense_A_dirty:
+            self._build_dense_A()
+        return self._dense_A @ s
 
     def _build_dense_A(self) -> np.ndarray:
         """Build a dense (N, N) version of A from the banded storage.
 
-        Used for batched matmul during imagination — BLAS dense matmul is
-        much faster than the 33-offset Python loop for large batches.
-        Called once after each update, then reused for all 40×5=200 rollouts.
+        Used for BLAS matmul/matvec in forward()/forward_batch(). Called
+        only when dirty (after each update/clip), then reused for all
+        rollouts of the frame. Vectorized single scatter over precomputed
+        band indices (~3 ms vs ~32 ms for the old per-offset loop).
         """
         A = np.zeros((self.N, self.N), dtype=np.float32)
-        for j, offset in enumerate(self.band_offsets):
-            if offset == 0:
-                np.fill_diagonal(A, self.A_band[:, j])
-            elif offset > 0:
-                idx = np.arange(self.N - offset)
-                A[idx, idx + offset] = self.A_band[:self.N - offset, j]
-            else:
-                idx = np.arange(-offset, self.N)
-                A[idx, idx + offset] = self.A_band[-offset:, j]
+        A[self._scatter_rows, self._scatter_cols] = \
+            self.A_band.ravel()[self._flat_valid]
         self._dense_A = A
         self._dense_A_dirty = False
         return A
 
     def forward_batch(self, S: np.ndarray) -> np.ndarray:
-        """Compute A @ S for a batch of states using the banded storage directly.
+        """Compute A @ S for a batch of states (dense BLAS matmul).
 
         Args:
             S: (B, N) batch of state vectors.
@@ -113,23 +119,16 @@ class BandedDynamics:
         Returns:
             (B, N) batch of A @ s for each row.
 
-        Uses the banded A_band (33 nonzero offsets) with broadcast shifted
-        multiplies — 33×(B×N) element ops instead of a full (B×N×N) dense
-        matmul. Numerically identical to the dense form (A is zero outside the
-        band) but ~30× faster when BLAS is single-threaded, and it avoids
-        rebuilding a 1000×1000 dense matrix every frame.
+        Uses the cached dense A (rebuilt only when weights change — the
+        dirty flag is maintained by update()/clip()). A dense (B,N)@(N,N)
+        BLAS matmul beats the 321-offset broadcast loop by ~2.3× (measured:
+        13.6 vs 31.8 ms for B=40, N=1296), and imagination calls this
+        5× per planning decision. Mathematically identical (A is zero
+        outside the band); float32 summation order differs by ~1e-6.
         """
-        S = np.asarray(S, dtype=np.float32)
-        res = np.zeros_like(S)
-        for j, offset in enumerate(self.band_offsets):
-            col = self.A_band[:, j]              # (N,)
-            if offset == 0:
-                res += col * S                   # (B,N) * (N,) broadcast
-            elif offset > 0:
-                res[:, :-offset] += col[:-offset] * S[:, offset:]
-            else:  # offset < 0
-                res[:, -offset:] += col[-offset:] * S[:, :self.N + offset]
-        return res
+        if self._dense_A_dirty:
+            self._build_dense_A()
+        return S @ self._dense_A.T
 
     def predict_batch(self, S: np.ndarray, A_actions: np.ndarray | None = None,
                       B=None) -> np.ndarray:
@@ -170,14 +169,11 @@ class BandedDynamics:
         norm_sq = max(float(s_t @ s_t), 1.0)  # prevent zero-state explosion
         scale_a = eta_a / norm_sq
 
-        # Banded A update
-        for j, offset in enumerate(self.band_offsets):
-            if offset == 0:
-                self.A_band[:, j] += scale_a * err * s_t
-            elif offset > 0:
-                self.A_band[:-offset, j] += scale_a * err[:-offset] * s_t[offset:]
-            else:  # offset < 0
-                self.A_band[-offset:, j] += scale_a * err[-offset:] * s_t[:self.N + offset]
+        # Vectorized banded update: ΔA_band[i,j] = scale·err[i]·s_t[i+offset_j]
+        # for valid band entries — one gather + broadcast multiply instead of
+        # 321 sliced adds (~3 ms vs ~20 ms). Mathematically identical.
+        s_gathered = s_t[self._cols]                    # (N, K)
+        self.A_band += scale_a * (err[:, None] * s_gathered) * self._valid
 
         self._dense_A_dirty = True
 

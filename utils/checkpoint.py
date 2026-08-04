@@ -23,7 +23,12 @@ def save_checkpoint(core: SEALCore, path: str, metadata: dict | None = None):
         "D": core.direction.D,
         "V_w": core.value.w,
         "V_e": core.value.e,
+        "V_rho": np.float64(core.value.rho),
         "pi_theta": core.policy.theta,
+        "R_w": core.reward_model.w,
+        "SF_w": core.successor.w,
+        "SF_e": core.successor.e,
+        "SF_rho": np.float64(core.successor.rho),
         "step_count": core.step_count,
     }
     if metadata:
@@ -51,8 +56,18 @@ def load_checkpoint(path: str) -> tuple[SEALCore, dict]:
         core.value.w = data["V_w"].astype(np.float32)
     if "V_e" in data.files:
         core.value.e = data["V_e"].astype(np.float32)
+    if "V_rho" in data.files:
+        core.value.rho = float(data["V_rho"])
+    if "SF_w" in data.files:
+        core.successor.w = data["SF_w"].astype(np.float32)
+    if "SF_e" in data.files:
+        core.successor.e = data["SF_e"].astype(np.float32)
+    if "SF_rho" in data.files:
+        core.successor.rho = float(data["SF_rho"])
     if "pi_theta" in data.files:
         core.policy.theta = data["pi_theta"].astype(np.float32)
+    if "R_w" in data.files:
+        core.reward_model.w = data["R_w"].astype(np.float32)
 
     core.step_count = int(data["step_count"])
 

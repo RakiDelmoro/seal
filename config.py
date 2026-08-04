@@ -71,13 +71,51 @@ V_INIT_STD = 0.01
 ETA_V = 1e-4                # nominal value learning rate
 GAMMA = 0.99                # discount factor
 LAMBDA = 0.95               # eligibility-trace decay (high → near-MC, still online)
-V_WEIGHT_DECAY = 1e-4       # prevent unbounded drift (the streaming anti-drift net)
+V_WEIGHT_DECAY = 0.0        # MUST stay ~0 on Pong: ±1 rewards arrive every
+                            # ~5000 frames, so any per-step decay drains V back
+                            # to zero between rewards (measured: 1e-4 erased
+                            # learned value 5× faster than sparse rewards could
+                            # rebuild it). Drift is already guarded by
+                            # V_ALPHA_MAX + V_TRACE_CLIP.
 V_TRACE_CLIP = 10.0         # max eligibility trace magnitude
 V_ALPHA_MAX = 0.25          # overshooting bound: cap effective step so each update
                              # corrects at most this fraction of the TD error.
                              # Stops the bootstrap-driven blow-ups that naive TD
                              # shows on sparse rewards (the "stream barrier").
 V_SEED = 45
+
+# ─── Average-reward (RVI) critic ───────────────────────────────
+# Pong's ±1 arrive at a near-steady rate (~one loss every ~9 frames), but the
+# score is NOT in the CNN state, so a discounted V(s)=w·s cannot tell states
+# apart and converges to a negative constant ("everything equally bad"; v_norm
+# climbs linearly). The average-reward / RVI critic subtracts the agent's own
+# running reward rate ρ from every reward, so quiet frames become small
+# positives ("I survived") and loss frames become sharp negatives ("lost the
+# ball here"). The residual TD error varies per state again — restoring the
+# contrast the planner needs. (Yu, Wan, Sutton 2025, "Average-reward RL in
+# semi-MDPs via relative value iteration", arXiv:2512.06218.)
+#
+# ρ is updated ONLY from real rewards (imagined TD must not let the model talk
+# to itself) and is saved/restored in checkpoints.
+RVI_ENABLE = True
+ETA_RHO = 5e-3            # step size for the running reward-rate estimate ρ
+
+# ─── Successor-feature value V_sf — "where does this state lead?" ─
+# The successor-features decomposition (Dayan 1993; Barreto et al. 2017):
+# V^π(s; w_R) = ψ^π(s)·w_R, where ψ is expected discounted future state
+# visitation. Learning the composition ψ·w_R directly costs one vector:
+# run TD(λ) on the REWARD-PREDICTOR stream r̂(s) instead of the raw reward.
+# r̂(s') is available nearly every frame, so credit propagates densely, and
+# the fixed point is the forward-looking landscape "how much reward the
+# future is likely to bring from here" — discriminative across states where
+# the raw V collapses to a constant. Imagination scores rollouts with V_sf
+# when SF_ENABLE (see SEALCore.scorer_value). Average-reward form with its
+# own ρ tracker (core/successor.py) so V_sf stays centred.
+#
+# Default OFF: A/B with `train.py --sf on` before flipping the default.
+SF_ENABLE = False
+ETA_SF = 1e-4               # critic lr for the auxiliary (r̂) TD stream
+SF_SEED = 49
 
 # ─── Policy π (actor) — streaming actor-critic ────────────────────
 # Learns by (1) imitating imagination's chosen first action every frame and
@@ -125,9 +163,48 @@ IMAGINATION_ALPHA_V_MAX = 0.5
 PRE_SCORE_WINDOW = 12          # frames before a +1 to save as goal states
 PRE_SCORE_MEMORY = 30          # max number of pre-score states to remember
 
+# ─── Reward model r̂(s) — learned reward predictor for imagined TD ─
+# One more linear readout: r̂(s) = w_R · s, trained by a normalized LMS delta
+# rule on every real (arrival-state, reward) pair. Needed because imagined
+# states have no real reward — the model must predict "would arriving here
+# bring reward?" during imagined rollouts.
+R_INIT_STD = 0.01
+ETA_R = 1e-3
+R_WEIGHT_DECAY = 1e-5
+R_SEED = 47
+
+# ─── Imagined TD — streaming Dyna without a replay buffer ─────────
+# After each real transition, imagine K short rollouts from the new state
+# using the learned dynamics (A, B), stepping with the current policy π,
+# and give the critic a one-step TD update per imagined step using the
+# predicted reward r̂. Nothing is stored — rollouts are generated fresh from
+# the CURRENT weights and consumed immediately: O(1) memory, no replay, no
+# off-policy correction. That is what makes it *streaming*.
+#
+# Model error compounds with depth, so each imagined update's learning rate
+# is scaled by a confidence κ that decays geometrically per imagined step.
+# Early in training (A/B still inaccurate) imagined updates are tiny; they
+# gain weight automatically as the world model improves.
+IMAGINED_TD_ENABLE = True
+IMAGINED_TD_K = 2              # imagined rollouts per real step
+IMAGINED_TD_HORIZON = 3        # imagined steps per rollout
+IMAGINED_TD_ETA = 5e-5         # critic lr per imagined update (before κ scaling)
+IMAGINED_TD_KAPPA_DECAY = 0.5  # confidence decay per imagined step
+IMAGINED_TD_EXPLORE = 0.2      # uniform-mix for imagined action selection
+IMAGINED_TD_SEED = 48
+
+# From-memory variant: additionally rehearse from PROVEN-GOOD states — the
+# pre-score memory holds the frames that preceded an actual +1. Rolling out
+# from them repeatedly re-enters the rewarded region, keeping V sharp around
+# success patterns across episodes (focused rehearsal instead of uniform
+# replay; still no buffer — the deque already exists for goal selection).
+# OFF by default: enable only after the base A/B is settled.
+IMAGINED_TD_FROM_MEMORY_ENABLE = False
+IMAGINED_TD_FROM_MEMORY_K = 1  # memory rollouts per real step (when memory nonempty)
+
 # ─── Exploration — ε-greedy exploration rate ──────────────────────
 # The ±1 reward adjusts ε: losing → explore more. The value function V and
-# policy π receive the raw reward directly for credit assignment (MC learning).
+# policy π receive the raw reward via streaming TD(λ) credit assignment.
 EPSILON_BASE = 0.3
 EPSILON_FLOOR = 0.05
 TOP5_SAMPLING_PROB = 0.10

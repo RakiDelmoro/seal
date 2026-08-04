@@ -13,28 +13,52 @@ sparse game reward via per-step streaming TD(λ) — one transition in, one
 update out, no episode buffering, no Monte Carlo fallback.
 
 Features for long runs:
+  python train.py                    50M frames, checkpoint every 100k
+  python train.py --resume PATH      resume from a checkpoint file
+  Ctrl+C                             graceful stop — checkpoint saved on exit
+
+Other options:
   --frame-budget N         : run until N total frames are processed
+  --episodes N             : episode-count mode instead of a frame budget
   --checkpoint-interval N  : save checkpoint every N frames
   --log-path PATH          : write per-episode metrics to CSV
-  --resume PATH            : resume from a checkpoint file
-
-Usage:
-  python train.py --frame-budget 100000 --checkpoint-interval 20000
-  python train.py --episodes 100 --seed 0
-  python train.py --resume results/seal_100k.npz --frame-budget 200000
 """
 from __future__ import annotations
 import argparse
-import time
-import numpy as np
+import os
+import signal
+
+# Pin math libraries to ONE thread each, BEFORE numpy/torch are imported.
+# Multi-threaded BLAS spawns a thread pool per process and the processes
+# thrash each other on a shared box (measured: 10-25x slowdown). One core
+# per training process is faster overall. Override via env if wanted.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 from perception.pipeline import PerceptionPipeline
 from env.pong_wrapper import PongEnv
+import core.seal_core as _seal_core_module
+import core.value as _value_module
 from core.seal_core import SEALCore
 from imagination.engine import ImaginationEngine
 from training.success_tracker import SuccessTracker
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.metrics import MetricsLogger
+
+DEFAULT_FRAME_BUDGET = 50_000_000
+
+# ── Graceful stop: Ctrl+C sets a flag; the loops exit at the next frame
+#    boundary and the final checkpoint block saves all progress. ──
+_stop_requested = False
+
+
+def _request_stop(signum, frame):
+    global _stop_requested
+    if not _stop_requested:
+        print("\n  !! Stop requested — finishing the current frame, "
+              "then saving a checkpoint...", flush=True)
+    _stop_requested = True
 
 
 def train(n_episodes: int = 100, seed: int = 0,
@@ -43,12 +67,28 @@ def train(n_episodes: int = 100, seed: int = 0,
           checkpoint_dir: str = "results",
           log_path: str | None = None,
           resume_path: str | None = None,
+          imagined_td: bool | None = None,
+          rvi: bool | None = None,
+          sf: bool | None = None,
           verbose: bool = True):
     """Unified SEAL training: learn and act from frame 1.
 
     Either episode-count mode (n_episodes) or frame-budget mode
     (runs until frame_budget total frames are processed).
+    imagined_td=None uses the config default; True/False overrides it
+    (for A/B experiments).
     """
+    if imagined_td is not None:
+        # A/B override: toggles only the current-state imagined TD. The
+        # from-memory variant (IMAGINED_TD_FROM_MEMORY_ENABLE) keeps its
+        # config default so experiments stay single-variable.
+        _seal_core_module.IMAGINED_TD_ENABLE = bool(imagined_td)
+    if rvi is not None:
+        # A/B override for the average-reward (RVI) critic.
+        _value_module.RVI_ENABLE = bool(rvi)
+    if sf is not None:
+        # A/B override for the successor-feature value (V_sf).
+        _seal_core_module.SF_ENABLE = bool(sf)
     logger = MetricsLogger(log_path) if log_path else None
 
     # ── Load or initialize ──────────────────────────────────────────
@@ -75,20 +115,27 @@ def train(n_episodes: int = 100, seed: int = 0,
         frame_budget = float('inf')
 
     if verbose:
+        budget_str = (f"{int(frame_budget):,} frames" if use_frame_budget
+                      else f"{n_episodes} episodes")
         print("=" * 70)
         print("SEAL — Imagination + online world-model learning")
         print("=" * 70)
+        print(f"  budget  : {budget_str}")
+        print(f"  metrics : {log_path or '(disabled)'}")
+        print(f"  stop    : Ctrl+C (or `python train.py --stop`) — "
+              f"progress is saved on exit")
+        print("=" * 70, flush=True)
 
     # ── Single unified loop ─────────────────────────────────────────
     ep = start_episodes
-    while total_frames < frame_budget:
+    while total_frames < frame_budget and not _stop_requested:
         if not use_frame_budget and ep >= start_episodes + n_episodes:
             break
 
         env = PongEnv(seed=seed + ep)
         frame, _ = env.reset()
         pipe.reset()
-        s = pipe.forward(frame)[0]
+        s = pipe.forward(frame)
 
         ep_reward = 0.0
         ep_len = 0
@@ -96,20 +143,22 @@ def train(n_episodes: int = 100, seed: int = 0,
         done = False
         pred_err_sum = 0.0
         td_delta_sum = 0.0
+        r_err_sum = 0.0
 
-        while not done and total_frames < frame_budget:
+        while not done and total_frames < frame_budget and not _stop_requested:
             # Unified action selection (gates 1-3 inside the engine)
             action, diag = engine.select_action(s, core, tracker)
             source = diag["source"]
 
             nf, r, term, trunc, _ = env.step(action)
             done = term or trunc
-            s_next = pipe.forward(nf)[0]
+            s_next = pipe.forward(nf)
 
             # Online learning (all components, every frame)
             m = core.step_learn(s, action, s_next, r, done, source=source)
             pred_err_sum += m["pred_err_norm"]
             td_delta_sum += m["td_delta"]
+            r_err_sum += abs(m["r_err"])
             ep_reward += r
             ep_len += 1
             total_frames += 1
@@ -127,6 +176,7 @@ def train(n_episodes: int = 100, seed: int = 0,
                                pred_err_sum / max(ep_len, 1),
                                score_stats["score_std"],
                                td_delta_sum / max(ep_len, 1),
+                               r_err_sum / max(ep_len, 1),
                                engine)
 
         if verbose and (ep % 5 == 0 or ep == start_episodes):
@@ -171,29 +221,56 @@ def train(n_episodes: int = 100, seed: int = 0,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SEAL training (single-phase)")
-    parser.add_argument("--episodes", type=int, default=100,
-                        help="number of episodes (if no frame-budget)")
+    parser = argparse.ArgumentParser(
+        description="SEAL training — learn and act from frame 1. "
+                    "Ctrl+C stops gracefully and saves a checkpoint.")
+    parser.add_argument("--episodes", type=int, default=None,
+                        help="episode-count mode instead of a frame budget")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-budget", type=int, default=None,
-                        help="total frame budget (overrides episode count)")
-    parser.add_argument("--checkpoint-interval", type=int, default=None,
+                        help=f"total frame budget "
+                             f"(default: {DEFAULT_FRAME_BUDGET:,})")
+    parser.add_argument("--checkpoint-interval", type=int, default=100_000,
                         help="save checkpoint every N frames")
     parser.add_argument("--checkpoint-dir", type=str, default="results")
-    parser.add_argument("--log-path", type=str, default="results/seal_metrics.csv",
+    parser.add_argument("--log-path", type=str, default="results/seal.csv",
                         help="CSV path for metrics (empty string to disable)")
     parser.add_argument("--resume", type=str, default=None,
                         help="resume from checkpoint .npz file")
+    parser.add_argument("--imagined-td", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override IMAGINED_TD_ENABLE for A/B runs")
+    parser.add_argument("--rvi", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override RVI_ENABLE (average-reward critic) "
+                             "for A/B runs")
+    parser.add_argument("--sf", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override SF_ENABLE (successor-feature value) "
+                             "for A/B runs")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
+    # Default: the full 50M-frame budget. --episodes switches to
+    # episode-count mode; --frame-budget overrides the budget.
+    frame_budget = (DEFAULT_FRAME_BUDGET if args.frame_budget is None
+                    else args.frame_budget)
+    if args.episodes is not None:
+        frame_budget = None
+
     train(
-        n_episodes=args.episodes,
+        n_episodes=args.episodes if args.episodes is not None else 100,
         seed=args.seed,
-        frame_budget=args.frame_budget,
+        frame_budget=frame_budget,
         checkpoint_interval=args.checkpoint_interval,
         checkpoint_dir=args.checkpoint_dir,
         log_path=args.log_path if args.log_path else None,
         resume_path=args.resume,
+        imagined_td={"on": True, "off": False}.get(args.imagined_td),
+        rvi={"on": True, "off": False}.get(args.rvi),
+        sf={"on": True, "off": False}.get(args.sf),
         verbose=not args.quiet,
     )

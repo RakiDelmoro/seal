@@ -9,7 +9,7 @@ geometric/observational, so there is no deadly triad on the planning path.
 For Pong, the goal is not handed to us but is **constructible from perception**:
 the ball on the opponent's side (we are safe / about to score) vs the ball on
 our side (danger). Both are visible in the state: the frozen CNN produces a
-9×9 grid of 32-channel features, and the ball — the most salient moving object
+9×9 grid of 16-channel features, and the ball — the most salient moving object
 — produces the highest activation at its grid position. `px` is horizontal:
   px = 0 → leftmost (our paddle)   →   px = 8 → rightmost (opponent).
 
@@ -23,7 +23,7 @@ from frame 1.
 from __future__ import annotations
 import numpy as np
 
-from config import N_STATE, CNN_GRID, CNN_CHANNELS, N_POSITIONS
+from config import CNN_GRID, CNN_CHANNELS
 
 
 class GeometricGoal:

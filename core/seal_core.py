@@ -27,11 +27,16 @@ from core.direction import Direction
 from core.gate import FeasibilityGate
 from core.value import Value
 from core.policy import Policy
+from core.reward_model import RewardModel
+from core.successor import SuccessorValue
+from imagination.imagined_td import imagined_td, imagined_td_from_memory
 
 from config import (
-    N_STATE, N_ACTIONS, ETA_A, ETA_B, ETA_D, ETA_V, ETA_PI_IMIT, ETA_PI_AC,
+    N_ACTIONS, ETA_A, ETA_B, ETA_D, ETA_V, ETA_PI_IMIT, ETA_PI_AC,
     GAMMA, LAMBDA, D_WEIGHT_DECAY, GOAL_WINDOW,
     PRE_SCORE_WINDOW, PRE_SCORE_MEMORY,
+    ETA_R, IMAGINED_TD_ENABLE, IMAGINED_TD_FROM_MEMORY_ENABLE,
+    IMAGINED_TD_SEED, SF_ENABLE, ETA_SF,
 )
 
 
@@ -45,6 +50,9 @@ class SEALCore:
         self.gate = FeasibilityGate()          # F — frozen
         self.value = Value()                   # V — streaming TD(λ) critic
         self.policy = Policy()                 # π — streaming actor-critic
+        self.reward_model = RewardModel()      # r̂ — reward predictor (imagined TD)
+        self.successor = SuccessorValue()      # V_sf — TD(λ) on the r̂ stream
+        self._rng = np.random.default_rng(IMAGINED_TD_SEED)
 
         # Rolling window of recent states for the geometric goal (s*).
         self.recent_states: deque = deque(maxlen=GOAL_WINDOW)
@@ -59,12 +67,23 @@ class SEALCore:
     def reset_episode(self):
         """Clear per-episode state on done. Weights persist across episodes."""
         self.value.reset_trace()
+        self.successor.reset_trace()
 
     # ── Encoding ───────────────────────────────────────────────────
     def encode_action(self, action_idx: int) -> np.ndarray:
         a = np.zeros(N_ACTIONS, dtype=np.float32)
         a[action_idx] = 1.0
         return a
+
+    # ── Scoring value for imagination ──────────────────────────────
+    def scorer_value(self):
+        """The value function imagination scores rollouts with.
+
+        SF_ENABLE → V_sf (successor-feature value: forward-looking, learned
+        from the dense r̂ stream), else the main critic V. Both are linear
+        readouts with the same forward() signature.
+        """
+        return self.successor if SF_ENABLE else self.value
 
     # ── Prediction ─────────────────────────────────────────────────
     def predict_next_state(self, s: np.ndarray,
@@ -132,6 +151,36 @@ class SEALCore:
         if source in ("greedy", "top5"):
             self.policy.update_imitation(s_t, action_idx, ETA_PI_IMIT)
 
+        # --- 4b2. Successor-feature value V_sf: TD(λ) on the r̂ stream ---
+        # The auxiliary reward is r̂(s_{t+1}) — the arrival-state reward
+        # (the TD convention used throughout SEAL; imagined TD queries r̂ on
+        # arrival states too). Queried BEFORE r̂'s own update this frame so
+        # V_sf never trains on a target it influenced. Available every frame,
+        # so credit propagates densely and V_sf learns "how much reward the
+        # future brings from here" — the discriminative landscape imagination
+        # needs for ranking.
+        sf_delta = 0.0
+        if SF_ENABLE:
+            sf_delta = self.successor.update(
+                s_t, self.reward_model.forward(s_tp1), s_tp1, done,
+                gamma=GAMMA, lam=LAMBDA, eta=ETA_SF,
+            )
+
+        # --- 4b. Reward model r̂: predict the reward observed on arrival ---
+        r_err = self.reward_model.update(s_tp1, reward, ETA_R)
+
+        # --- 4c. Imagined TD: rehearse short futures on the world model ---
+        # Streaming Dyna without a replay buffer: generate rollouts from the
+        # CURRENT weights, give the critic one-step TD updates with predicted
+        # rewards, discard everything. Skipped on episode end (no bootstrap
+        # target across the boundary).
+        imag = {"n_updates": 0, "imagined_delta_avg": 0.0, "r_hat_avg": 0.0}
+        if IMAGINED_TD_ENABLE and not done:
+            imag = imagined_td(self, s_tp1, rng=self._rng)
+            # Focused rehearsal from proven-good states (default: off).
+            if IMAGINED_TD_FROM_MEMORY_ENABLE and self.pre_score_states:
+                imagined_td_from_memory(self, rng=self._rng)
+
         # --- 5. Goal memory ---
         self.recent_states.append(s_t.copy())
         self._pre_score_window.append(s_t.copy())
@@ -148,6 +197,11 @@ class SEALCore:
             "pred_err_norm": pred_err_norm,
             "actual_reward": reward,
             "td_delta": td_delta,
+            "sf_delta": sf_delta,
+            "r_err": r_err,
+            "r_hat_avg": imag["r_hat_avg"],
+            "imagined_delta_avg": imag["imagined_delta_avg"],
+            "imagined_updates": imag["n_updates"],
         }
 
     # ── Diagnostics ────────────────────────────────────────────────
@@ -167,5 +221,9 @@ class SEALCore:
             "n_pre_score_states": len(self.pre_score_states),
             "d_norm": float(np.linalg.norm(self.direction.D)),
             "v_norm": float(np.linalg.norm(self.value.w)),
+            "v_rho": float(self.value.rho),
             "pi_norm": float(np.linalg.norm(self.policy.theta)),
+            "r_norm": float(np.linalg.norm(self.reward_model.w)),
+            "sf_norm": float(np.linalg.norm(self.successor.w)),
+            "sf_rho": float(self.successor.rho),
         }

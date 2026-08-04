@@ -8,13 +8,13 @@ lets the linear banded A represent bounces and keep pred_err falling.
 
   Input:  2-channel image (normalized frame, |Δframe|)  →  (2, 84, 84)
   Conv1:  2→16 channels, 8×8 kernel, stride 4, leaky_relu → (16, 20, 20)
-  Conv2:  16→32 channels, 4×4 kernel, stride 2, leaky_relu → (32, 9, 9)
-  Output: 9×9 grid × 32 channels = 2592 features, flattened (py, px, channel)
+  Conv2:  16→16 channels, 4×4 kernel, stride 2, leaky_relu → (16, 9, 9)
+  Output: 9×9 grid × 16 channels = 1296 features, flattened (py, px, channel)
 
 The flatten order (py, px, channel) makes each spatial position (py, px) map
-to a contiguous 32-dim block of state — the locality structure the banded A
-needs. A ball shifting one grid cell shifts activation by one 32-dim block,
-within the ±32 band.
+to a contiguous 16-dim block of state — the locality structure the banded A
+needs. A ball shifting one grid cell shifts activation by one 16-dim block,
+well within the ±160 band.
 
 FROZEN: weights are random (Kaiming init), never trained. This is the
 grid-cell principle (fixed nonlinear high-D lifting) applied to images —
@@ -33,6 +33,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# Single-threaded on purpose: SEAL runs multiple CPU processes side by side
+# (training arms, evaluation). Multi-threaded conv/BLAS thrashes across
+# processes — a ~1 ms conv2d measured at 50 ms under contention. One core
+# per process is faster overall.
+torch.set_num_threads(1)
 
 
 class FrozenCNN:
@@ -59,10 +65,10 @@ class FrozenCNN:
         w1 = rng.normal(0, np.sqrt(2.0 / fan_in1),
                         (conv1_channels, 2, k1, k1)).astype(np.float32)
 
-        # Layer 2: 16→32, kernel 4, stride 2 → 9×9
+        # Layer 2: 16→16, kernel 4, stride 2 → 9×9
         k2 = 4
         s2 = 2
-        h2 = (h1 - k2) // s2 + 2            # 9 (h1 - k2 = 16; (16)//2 + 1 = 9)
+        h2 = (h1 - k2) // s2 + 1            # 9
         fan_in2 = conv1_channels * k2 * k2
         w2 = rng.normal(0, np.sqrt(2.0 / fan_in2),
                         (conv2_channels, conv1_channels, k2, k2)
@@ -77,8 +83,8 @@ class FrozenCNN:
         # Output geometry
         self.grid_size = h2                 # 9
         self.n_positions = h2 * h2          # 81
-        self.channels = conv2_channels      # 32
-        self.n_features = self.n_positions * self.channels  # 2592
+        self.channels = conv2_channels      # 16
+        self.n_features = self.n_positions * self.channels  # 1296
 
         # Precompute the position→state-dim ranges (locality-ordered)
         self.position_ranges = []

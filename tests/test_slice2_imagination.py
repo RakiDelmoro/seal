@@ -11,7 +11,7 @@ Tests:
 import numpy as np
 import pytest
 
-from config import N_STATE, CNN_GRID, CNN_CHANNELS
+from config import N_STATE
 from imagination.engine import ImaginationEngine
 from imagination.sampler import sample_trajectories
 from imagination.evaluator import evaluate_trajectories
@@ -27,7 +27,7 @@ def test_cnn_produces_locality_ordered_state():
     """The frozen CNN outputs a state of the right shape."""
     pipe = PerceptionPipeline()
     frame = np.random.rand(84, 84).astype(np.float32)
-    s, _ = pipe.forward(frame)
+    s = pipe.forward(frame)
     assert s.shape == (N_STATE,)
     assert np.linalg.norm(s) > 0
 

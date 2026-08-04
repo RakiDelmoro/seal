@@ -18,7 +18,7 @@ from core.value import Value
 from core.policy import Policy
 from perception.pipeline import PerceptionPipeline
 from env.pong_wrapper import PongEnv
-from config import N_STATE, N_ACTIONS, CNN_GRID, CNN_CHANNELS, A_HALF_BAND
+from config import N_STATE, N_ACTIONS, CNN_GRID, CNN_CHANNELS
 
 
 def create_synthetic_ball_state(px: int, py: int, magnitude: float = 1.0) -> np.ndarray:
@@ -149,10 +149,10 @@ def test_real_pong_rollout():
 
     errs = []
     for i in range(50):
-        s = pipe.forward(frame)[0]
+        s = pipe.forward(frame)
         action = int(np.random.randint(N_ACTIONS))
         nf, r, term, trunc, _ = env.step(action)
-        s_next = pipe.forward(nf)[0]
+        s_next = pipe.forward(nf)
         pred = core.predict_next_state(s, action)
         err = np.linalg.norm(s_next - pred)
         errs.append(err)

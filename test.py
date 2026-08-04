@@ -14,6 +14,7 @@ from core.seal_core import SEALCore
 from imagination.engine import ImaginationEngine
 from training.success_tracker import SuccessTracker
 from utils.checkpoint import load_checkpoint
+import core.seal_core as _seal_core_module
 
 
 def evaluate(core: SEALCore, pipe: PerceptionPipeline,
@@ -47,7 +48,7 @@ def evaluate(core: SEALCore, pipe: PerceptionPipeline,
     for ep in range(n_episodes):
         frame, info = env.reset(seed=seed + ep)
         pipe.reset()
-        s = pipe.forward(frame)[0]
+        s = pipe.forward(frame)
 
         ep_reward = 0.0
         scored = lost = 0
@@ -57,7 +58,7 @@ def evaluate(core: SEALCore, pipe: PerceptionPipeline,
             action, diag = engine.select_action(s, core, tracker)
             next_frame, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            s_next = pipe.forward(next_frame)[0]
+            s_next = pipe.forward(next_frame)
 
             # No learning during evaluation
             if reward > 0:
@@ -106,8 +107,14 @@ if __name__ == "__main__":
                         help="if no checkpoint, pre-train this many episodes")
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--sf", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override SF_ENABLE (successor-feature value) "
+                             "for evaluation")
     args = parser.parse_args()
 
+    if args.sf is not None:
+        _seal_core_module.SF_ENABLE = (args.sf == "on")
     if args.checkpoint:
         core, meta = load_checkpoint(args.checkpoint)
         pipe = PerceptionPipeline()

@@ -8,7 +8,7 @@ K× speedup over the per-trajectory loop. For each imagination step:
   ε ~ N(0, σ²)                         (K, A) — noise for diversity
   e = F ⊙ (u + ε)                     (K, A) — eligibility
   a = argmax(e, axis=1)                (K,) — winner-take-all
-  ŝ = A·ŝ + B·a + b                   (K, N) — PREDICT next state
+  ŝ = A·ŝ + B·a                       (K, N) — PREDICT next state
 
 Adaptive noise: σ = max(floor, scale · ‖u‖) per trajectory.
 """
