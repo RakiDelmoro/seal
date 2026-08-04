@@ -114,7 +114,11 @@ ETA_RHO = 5e-3            # step size for the running reward-rate estimate ρ
 #
 # Default OFF: A/B with `train.py --sf on` before flipping the default.
 SF_ENABLE = False
-ETA_SF = 1e-4               # critic lr for the auxiliary (r̂) TD stream
+ETA_SF = 1e-3               # critic lr for the auxiliary (r̂) TD stream —
+                            # 1e-4 froze V_sf at init over 120k frames: the
+                            # r̂ stream's TD errors (~±0.05) are 10x smaller
+                            # than the main critic's, so it needs the same
+                            # rate as the other small-signal readouts B/D/r̂
 SF_SEED = 49
 
 # ─── Policy π (actor) — streaming actor-critic ────────────────────
