@@ -29,6 +29,7 @@ from config import (
     N_TRAJECTORIES, IMAGINATION_HORIZON, N_ACTIONS,
     EPSILON_BASE, EPSILON_FLOOR, TOP5_SAMPLING_PROB, DANGER_PENALTY,
     PI_CONFIDENCE_THRESHOLD, PI_FORCE_IMAGINATION, BOOTSTRAP_ENABLE,
+    IMAGINATION_ENABLE,
 )
 
 
@@ -108,6 +109,15 @@ class ImaginationEngine:
             self._source_counts["epsilon"] += 1
             return action, {
                 "action": action, "source": "epsilon",
+                "epsilon": epsilon, "n_trajectories": 0,
+            }
+
+        # ── Ablation: imagination off → System 1 only ───────────────
+        if not IMAGINATION_ENABLE:
+            action = core.policy.predict_action(s_t)
+            self._source_counts["policy"] += 1
+            return action, {
+                "action": action, "source": "policy",
                 "epsilon": epsilon, "n_trajectories": 0,
             }
 

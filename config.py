@@ -188,9 +188,16 @@ PI_INIT_STD = 0.01
 ETA_PI_IMIT = 1e-3          # imitate imagination / chosen action
 ETA_PI_AC = 1e-4            # per-step actor-critic rate (scaled by TD error δ)
 PI_WEIGHT_DECAY = 1e-5
+
 PI_CONFIDENCE_THRESHOLD = 0.8  # max softmax prob above which π is "confident"
 PI_FORCE_IMAGINATION = 0.2     # probability to still run imagination when π confident
 PI_SEED = 46
+# ─── Imagination master switch ──────────────────────────────
+# Ablation switch: with imagination disabled the agent is System 1 only —
+# adaptive ε exploration + the learned policy π (trained purely by
+# actor-critic, no imitation signal since nothing imagines). Used to answer
+# "is the planning stack contributing anything yet?" (--imagination on|off).
+IMAGINATION_ENABLE = True
 
 # ─── Imagination engine (System 2 planning) ───────────────────────
 # Samples 40 noisy rollouts on the cognitive map (using A,B + D), scores

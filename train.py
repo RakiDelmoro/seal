@@ -74,6 +74,7 @@ def train(n_episodes: int = 100, seed: int = 0,
           sf: bool | None = None,
           bootstrap: bool | None = None,
           commit: bool | None = None,
+          imagination: bool | None = None,
           verbose: bool = True):
     """Unified SEAL training: learn and act from frame 1.
 
@@ -97,6 +98,9 @@ def train(n_episodes: int = 100, seed: int = 0,
     if bootstrap is not None:
         # A/B override for terminal-value bootstrap scoring.
         _engine_module.BOOTSTRAP_ENABLE = bool(bootstrap)
+    if imagination is not None:
+        # Ablation override: imagination (System 2) on/off.
+        _engine_module.IMAGINATION_ENABLE = bool(imagination)
     if commit is not None:
         # A/B override for commit sampling (distinct openings + stubbornness).
         _sampler_module.SAMPLER_COMMIT_ENABLE = bool(commit)
@@ -267,6 +271,10 @@ if __name__ == "__main__":
                         choices=["on", "off"],
                         help="override SAMPLER_COMMIT_ENABLE (distinct "
                              "openings + stubbornness) for A/B runs")
+    parser.add_argument("--imagination", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override IMAGINATION_ENABLE (ablation: "
+                             "System 1 only vs planning)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _request_stop)
@@ -293,4 +301,5 @@ if __name__ == "__main__":
         verbose=not args.quiet,
         bootstrap={"on": True, "off": False}.get(args.bootstrap),
         commit={"on": True, "off": False}.get(args.commit),
+        imagination={"on": True, "off": False}.get(args.imagination),
     )
