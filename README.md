@@ -336,6 +336,41 @@ seal/
 └── analyze_ab.py            # Compare A/B imagined-TD training logs + plot
 ```
 
+## Monitoring: competitiveness metrics (read these first)
+
+Win rate at ~0.5% is too sparse to trust at the 120k-frame budget — control
+runs themselves vary 0.52–0.65% seed-to-seed. The denser, steadier signal:
+
+- `frames_per_loss` = episode_length / losses — how long each rally
+  survived. A longer episode means the agent is holding its own against the
+  opponent, not merely waiting to lose. This is the primary metric.
+- `episode_length` — average rally length.
+- win rate — the goal, but noisy at this budget.
+
+Use `analyze_runs.py results/*.csv` to compare runs on all three (handles
+appended/restarted CSVs by analyzing the last segment).
+
+## The Oak roadmap (FC-STOMP) — where SEAL stands
+
+The OaK architecture (Sutton, RLC 2025 keynote) has three special features;
+SEAL has the first:
+
+1. **All components learn continually** — ✅ SEAL: everything updates online
+   from frame 1.
+2. **A dedicated step-size per weight, meta-learned by online
+   cross-validation** — ❌ SEAL uses fixed η per component.
+3. **Abstractions continually created in a five-step progression
+   (FC-STOMP)** — ❌ SEAL has none:
+   - **F**eature construction — features are fixed (frozen CNN), not built.
+   - **S**ubTask posing based on features.
+   - **T**emporal abstraction: learning an **Option** to solve the subtask.
+   - O: learning a **Model** of the option.
+   - M/P: **Planning** using the option's model.
+
+GCML's imagination (borrowed) covers only the last step, and only at the
+primitive-action level. The missing middle — subtasks and options — is the
+actual OaK build.
+
 ---
 
 ## Getting started

@@ -18,7 +18,7 @@ from core.seal_core import SEALCore
 
 CSV_FIELDS = [
     "timestamp", "phase", "episode", "step_count",
-    "episode_reward", "episode_length", "scored", "lost",
+    "episode_reward", "episode_length", "scored", "lost", "frames_per_loss",
     "epsilon", "a_op_norm", "pred_err_avg",
     "d_norm", "rollout_norm_ratio", "score_std",
     "v_norm", "pi_norm", "td_delta_avg", "rho",
@@ -72,6 +72,7 @@ class MetricsLogger:
             "episode_length": episode_length,
             "scored": scored,
             "lost": lost,
+            "frames_per_loss": f"{episode_length / max(lost, 1):.2f}",
             "epsilon": f"{epsilon:.4f}",
             "a_op_norm": f"{diag['a_op_norm']:.4f}",
             "pred_err_avg": f"{pred_err_avg:.4f}",
