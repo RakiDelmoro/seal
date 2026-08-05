@@ -131,12 +131,20 @@ SF_SEED = 49
 # terminal Q), classical MPC (terminal cost) — score the short rollout by
 # predicted reward along the way plus the LEARNED VALUE at the endpoint:
 #
-#   score = Σ_t γᵗ r̂(ŝ_t) + γᴴ · V_term(ŝ_H) − danger_penalty · 𝟙[danger]
+# score = Σ_t γᵗ r̂(ŝ_t) + γᴴ · V_term(ŝ_H) − danger_penalty · 𝟙[danger]
 #
 # V_term = core.scorer_value() (V_sf when SF_ENABLE, else V). The rollout no
 # longer needs to reach the ghost-goal; s* still steers rollout DIRECTION via
-# the inverse model D, but the grade comes from value. A/B: --bootstrap off.
-BOOTSTRAP_ENABLE = True
+# the inverse model D, but the grade comes from value.
+#
+# DEFAULT OFF after a negative 120k A/B (0.34% vs 0.65% win rate): the
+# bootstrap terms have ~30x LESS variance than the geometric distance term
+# (endpoint spread is only 0.31 in a ~10-norm state space — the 40 rollouts
+# are nearly the same plan), so the ranking degenerates to float noise and
+# top-5 sampling collapses. The geometric blend is noisy too, but its large
+# distance numbers keep top-5 action diversity alive. Fix the rollout
+# DIVERSITY first, then revisit terminal bootstrapping.
+BOOTSTRAP_ENABLE = False
 
 # ─── Policy π (actor) — streaming actor-critic ────────────────────
 # Learns by (1) imitating imagination's chosen first action every frame and

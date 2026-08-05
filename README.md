@@ -213,7 +213,12 @@ without lengthening rollouts. The scorer is vectorized (one matmul each for
 trip rewards and terminal values). Learning gate: bootstrap scoring activates
 only once the terminal value's norm has grown 5% past init — before that,
 imagination falls back to pure geometric scoring (GCML's original form).
-Default ON; A/B with `train.py --bootstrap on|off`.
+Default **OFF after a negative 120k A/B** (0.34% vs 0.65% win rate): the
+bootstrap terms carry ~30× less variance than the geometric distance term —
+the 40 rollouts end only 0.31 apart in a ~10-norm state space, so value
+scores tie and top-5 sampling collapses. The geometric blend is noisy too,
+but its large distance numbers keep action diversity alive. Fix rollout
+DIVERSITY first, then revisit. A/B with `train.py --bootstrap on|off`.
 
 ### Normalized LMS
 
