@@ -163,7 +163,7 @@ BOOTSTRAP_ENABLE = False
 # The bonus scales with the steering magnitude, so a STRONG goal can still
 # override a stubborn rollout (compass intact) while the constant weak
 # steering that merges everyone no longer wins. A/B: --commit on|off.
-SAMPLER_COMMIT_ENABLE = True
+SAMPLER_COMMIT_ENABLE = False
 SAMPLER_COMMIT_BONUS = 1.0      # × scale × ‖u‖ on the committed action's e
 SAMPLER_COMMIT_SCALE = 1.0      # stubbornness fraction of steering strength —
                                 # measured on the 120k checkpoint: endpoint
@@ -171,6 +171,13 @@ SAMPLER_COMMIT_SCALE = 1.0      # stubbornness fraction of steering strength —
                                 # (1.0) → 0.998 (2.0). 1.0 doubles diversity
                                 # while a genuinely stronger steering signal
                                 # can still override the committed action.
+                                #
+# DEFAULT OFF after a negative 120k A/B (0.27% vs 0.62% win rate): the
+# diversity mechanism works (score_std stays 1.1-3.3 vs 0.4 control) but
+# diverse plans ranked by the degenerate GEOMETRIC score (distance to an
+# unreachable ghost-goal) are worse than merged plans. Commit is a
+# COMPONENT of the synthesis: --commit on --bootstrap on --sf on ranks
+# the now-diverse plans by the learned value instead of ghost distance.
 
 # ─── Policy π (actor) — streaming actor-critic ────────────────────
 # Learns by (1) imitating imagination's chosen first action every frame and

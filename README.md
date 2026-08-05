@@ -244,7 +244,15 @@ the merge with two mechanisms:
 Measured on the 120k checkpoint: endpoint spread 0.325 (off) → 0.660
 (scale 1.0), first-action distribution balanced [0.33, 0.33, 0.33]. The
 sampler also skips norm-renormalization on degenerate zero-norm states
-(previously it crushed rollouts to ~0). A/B: `train.py --commit on|off`.
+(previously it crushed rollouts to ~0).
+
+Default **OFF after a negative 120k A/B** (0.27% vs 0.62% win rate): the
+diversity mechanism works (score_std stays 1.1–3.3 vs 0.4 control), but
+diverse plans ranked by the degenerate geometric score are worse than
+merged plans. Commit is a COMPONENT of the synthesis
+`--commit on --bootstrap on --sf on` (rank diverse plans by learned value);
+that combination scored 0.28% — still not better than control, so all three
+flags default off pending a longer/multi-seed study. A/B: `--commit on|off`.
 
 ### Normalized LMS
 
