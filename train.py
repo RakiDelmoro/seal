@@ -41,6 +41,7 @@ from env.pong_wrapper import PongEnv
 import core.seal_core as _seal_core_module
 import core.value as _value_module
 import imagination.engine as _engine_module
+import imagination.sampler as _sampler_module
 from core.seal_core import SEALCore
 from imagination.engine import ImaginationEngine
 from training.success_tracker import SuccessTracker
@@ -72,6 +73,7 @@ def train(n_episodes: int = 100, seed: int = 0,
           rvi: bool | None = None,
           sf: bool | None = None,
           bootstrap: bool | None = None,
+          commit: bool | None = None,
           verbose: bool = True):
     """Unified SEAL training: learn and act from frame 1.
 
@@ -95,6 +97,9 @@ def train(n_episodes: int = 100, seed: int = 0,
     if bootstrap is not None:
         # A/B override for terminal-value bootstrap scoring.
         _engine_module.BOOTSTRAP_ENABLE = bool(bootstrap)
+    if commit is not None:
+        # A/B override for commit sampling (distinct openings + stubbornness).
+        _sampler_module.SAMPLER_COMMIT_ENABLE = bool(commit)
 
     # ── Load or initialize ──────────────────────────────────────────
     if resume_path:
@@ -258,6 +263,10 @@ if __name__ == "__main__":
                         choices=["on", "off"],
                         help="override BOOTSTRAP_ENABLE (terminal-value "
                              "scoring) for A/B runs")
+    parser.add_argument("--commit", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override SAMPLER_COMMIT_ENABLE (distinct "
+                             "openings + stubbornness) for A/B runs")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _request_stop)
@@ -283,4 +292,5 @@ if __name__ == "__main__":
         sf={"on": True, "off": False}.get(args.sf),
         verbose=not args.quiet,
         bootstrap={"on": True, "off": False}.get(args.bootstrap),
+        commit={"on": True, "off": False}.get(args.commit),
     )

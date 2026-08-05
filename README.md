@@ -220,6 +220,32 @@ scores tie and top-5 sampling collapses. The geometric blend is noisy too,
 but its large distance numbers keep action diversity alive. Fix rollout
 DIVERSITY first, then revisit. A/B with `train.py --bootstrap on|off`.
 
+### Commit sampling — one intention per rollout
+
+GCML's sampling relies on noise over `u = D·Δ` to diversify rollouts — valid
+in the paper's agent-only maze domains where action IS motion. In Pong it
+fails measurably: autonomous drift carries all rollouts identically, B·a is
+a ~0.4 nudge in a ~10-norm state, and every rollout re-aims at the same
+stale goal each step — 44% of rollouts pick different first actions yet
+endpoints land only 0.31 apart. One mind, forty bodies.
+
+Commit sampling (`imagination/sampler.py`, `SAMPLER_COMMIT_ENABLE`) fixes
+the merge with two mechanisms:
+
+1. **Dealt openings** — first actions are handed out (K/3 per action,
+   shuffled), not drawn from the steering lottery. Every intention is
+   always on the table.
+2. **Stubbornness** — each rollout keeps a bonus on its committed action for
+   the whole horizon: `bonus = SAMPLER_COMMIT_BONUS × SAMPLER_COMMIT_SCALE
+   × ‖u‖`. Scaling with ‖u‖ means a genuinely stronger steering signal can
+   still override the commitment (compass intact) while the constant weak
+   pull that merges everyone no longer wins.
+
+Measured on the 120k checkpoint: endpoint spread 0.325 (off) → 0.660
+(scale 1.0), first-action distribution balanced [0.33, 0.33, 0.33]. The
+sampler also skips norm-renormalization on degenerate zero-norm states
+(previously it crushed rollouts to ~0). A/B: `train.py --commit on|off`.
+
 ### Normalized LMS
 
 All delta rules divide by `‖input‖²`, making the effective learning rate independent of input magnitude (typical Pong states have `‖s‖² ≈ 140`).
@@ -269,11 +295,12 @@ seal/
 │   └── seal_core.py         #   Combines all + per-step online updates (step_learn)
 │
 ├── imagination/             # Goal-directed trajectory sampling (System 2)
+│   ├── sampler.py           #   40 noisy rollouts (batched, horizon 5);
+│   │                        #      commit sampling: dealt openings + stubbornness
 │   ├── geometric_goal.py    #   s* selection (pre-score memory / geometric proxy)
 │   │                        #   + geometric rollout scoring + danger detection
 │   ├── evaluator.py         #   Blend α·V + (1−α)·geometry + danger penalty;
 │   │                        #      BootstrapScorer: Σ γᵗr̂ + γᴴV_term − danger
-│   ├── sampler.py           #   40 noisy rollouts (batched, horizon 5)
 │   ├── engine.py            #   Three gates: ε / policy fast path / imagination
 │   └── imagined_td.py       #   Streaming Dyna: rehearsed futures train V
 │
@@ -412,6 +439,19 @@ python train.py --frame-budget 300000 --seed 0 --sf on --bootstrap off \
 What to watch: once V_sf grows past init (gate opens), `score_std` should be
 higher with bootstrap on — plans are ranked by value instead of tied on
 distance. Win rate is the real test.
+
+### Run the commit-sampling A/B experiment
+
+```bash
+python train.py --frame-budget 300000 --seed 0 --commit on \
+  --log-path results/ab_commit_on.csv
+python train.py --frame-budget 300000 --seed 0 --commit off \
+  --log-path results/ab_commit_off.csv
+```
+
+What to watch: `score_std` should stay higher with commit on (plans stay
+apart, ranking is real); first-action diversity [~0.33, ~0.33, ~0.33].
+Win rate is the real test.
 
 ### Run tests
 

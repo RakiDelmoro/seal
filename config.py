@@ -146,6 +146,32 @@ SF_SEED = 49
 # DIVERSITY first, then revisit terminal bootstrapping.
 BOOTSTRAP_ENABLE = False
 
+# ─── Commit sampling — one intention per rollout ──────────────────
+# GCML's sampling assumption: noise on u = D·Δ produces diverse rollouts.
+# That holds in the paper's agent-only maze domains (action IS the motion).
+# In Pong it fails: autonomous drift (A) carries all rollouts the same way,
+# B·a is a ~0.4 nudge in a ~10-norm state, and every rollout re-aims at the
+# same ghost-goal each step — so 44% of rollouts pick different first
+# actions yet endpoints end only 0.31 apart (measured). Different openings
+# merge back together.
+#
+# Commit sampling fixes the merge: (1) first actions are DEALT, not drawn —
+# K/N_ACTIONS rollouts commit to each action, so every intention is always
+# on the table; (2) each rollout keeps a fixed preference bonus for its own
+# committed action for the whole horizon:
+#     bonus_k = SAMPLER_COMMIT_BONUS × SAMPLER_COMMIT_SCALE × ‖u_k‖
+# The bonus scales with the steering magnitude, so a STRONG goal can still
+# override a stubborn rollout (compass intact) while the constant weak
+# steering that merges everyone no longer wins. A/B: --commit on|off.
+SAMPLER_COMMIT_ENABLE = True
+SAMPLER_COMMIT_BONUS = 1.0      # × scale × ‖u‖ on the committed action's e
+SAMPLER_COMMIT_SCALE = 1.0      # stubbornness fraction of steering strength —
+                                # measured on the 120k checkpoint: endpoint
+                                # spread 0.325 (off) → 0.456 (0.5) → 0.660
+                                # (1.0) → 0.998 (2.0). 1.0 doubles diversity
+                                # while a genuinely stronger steering signal
+                                # can still override the committed action.
+
 # ─── Policy π (actor) — streaming actor-critic ────────────────────
 # Learns by (1) imitating imagination's chosen first action every frame and
 # (2) a per-step actor-critic update: reinforce the taken action by the TD(λ)
