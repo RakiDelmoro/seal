@@ -40,6 +40,7 @@ from perception.pipeline import PerceptionPipeline
 from env.pong_wrapper import PongEnv
 import core.seal_core as _seal_core_module
 import core.value as _value_module
+import imagination.engine as _engine_module
 from core.seal_core import SEALCore
 from imagination.engine import ImaginationEngine
 from training.success_tracker import SuccessTracker
@@ -70,6 +71,7 @@ def train(n_episodes: int = 100, seed: int = 0,
           imagined_td: bool | None = None,
           rvi: bool | None = None,
           sf: bool | None = None,
+          bootstrap: bool | None = None,
           verbose: bool = True):
     """Unified SEAL training: learn and act from frame 1.
 
@@ -90,6 +92,9 @@ def train(n_episodes: int = 100, seed: int = 0,
         # A/B override for the successor-feature value (V_sf).
         _seal_core_module.SF_ENABLE = bool(sf)
     logger = MetricsLogger(log_path) if log_path else None
+    if bootstrap is not None:
+        # A/B override for terminal-value bootstrap scoring.
+        _engine_module.BOOTSTRAP_ENABLE = bool(bootstrap)
 
     # ── Load or initialize ──────────────────────────────────────────
     if resume_path:
@@ -249,6 +254,10 @@ if __name__ == "__main__":
                         help="override SF_ENABLE (successor-feature value) "
                              "for A/B runs")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--bootstrap", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override BOOTSTRAP_ENABLE (terminal-value "
+                             "scoring) for A/B runs")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _request_stop)
@@ -273,4 +282,5 @@ if __name__ == "__main__":
         rvi={"on": True, "off": False}.get(args.rvi),
         sf={"on": True, "off": False}.get(args.sf),
         verbose=not args.quiet,
+        bootstrap={"on": True, "off": False}.get(args.bootstrap),
     )

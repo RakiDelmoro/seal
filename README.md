@@ -189,6 +189,32 @@ Wiring: imagination scores rollouts with `core.scorer_value()` (V_sf when
 stream from the environment reward) and its own trace. The main critic keeps
 driving the actor. Default OFF — A/B with `train.py --sf on|off`.
 
+### Bootstrap trajectory scoring — "arrive OR be valued"
+
+GCML scores rollouts by absolute distance to the goal (`−‖ŝ_H − s*‖`). That
+assumes the rollout can ARRIVE. On Pong it cannot: the goal is ~150 units
+away (a ~100-frame-old state, stale) while a 5-step rollout walks ~3 —
+measured: the best of 40 rollouts got closer to the goal in 0 of 43 windows,
+while doing nothing got closer 35% of the time. All plans tie on distance,
+"best" is noise.
+
+The standard fix across model-based RL — Dreamer (arXiv:1912.01603: short
+horizons need value bootstrapping), MuZero (leaves scored by the value
+network), TD-MPC (5-step rollouts + learned terminal Q), classical MPC
+(terminal cost) — grades the short rollout by predicted reward along the way
+plus LEARNED VALUE at the endpoint:
+
+    score = Σ_t γᵗ r̂(ŝ_t) + γᴴ · V_term(ŝ_H) − danger_penalty · 𝟙[danger]
+
+`V_term` is `core.scorer_value()` (V_sf when SF is on). The rollout no longer
+needs to reach the ghost-goal; s* still steers rollout direction via D, but
+the grade comes from value — making the effective planning horizon infinite
+without lengthening rollouts. The scorer is vectorized (one matmul each for
+trip rewards and terminal values). Learning gate: bootstrap scoring activates
+only once the terminal value's norm has grown 5% past init — before that,
+imagination falls back to pure geometric scoring (GCML's original form).
+Default ON; A/B with `train.py --bootstrap on|off`.
+
 ### Normalized LMS
 
 All delta rules divide by `‖input‖²`, making the effective learning rate independent of input magnitude (typical Pong states have `‖s‖² ≈ 140`).
@@ -240,8 +266,9 @@ seal/
 ├── imagination/             # Goal-directed trajectory sampling (System 2)
 │   ├── geometric_goal.py    #   s* selection (pre-score memory / geometric proxy)
 │   │                        #   + geometric rollout scoring + danger detection
+│   ├── evaluator.py         #   Blend α·V + (1−α)·geometry + danger penalty;
+│   │                        #      BootstrapScorer: Σ γᵗr̂ + γᴴV_term − danger
 │   ├── sampler.py           #   40 noisy rollouts (batched, horizon 5)
-│   ├── evaluator.py         #   Blend α·V + (1−α)·geometry + danger penalty
 │   ├── engine.py            #   Three gates: ε / policy fast path / imagination
 │   └── imagined_td.py       #   Streaming Dyna: rehearsed futures train V
 │
@@ -367,6 +394,19 @@ python train.py --frame-budget 300000 --seed 0 --sf off \
 
 What to watch: `sf_rho` converges to the r̂-stream mean; `score_std` should
 stay higher with SF on (V_sf discriminates states that flat V cannot).
+
+### Run the bootstrap scoring A/B experiment
+
+```bash
+python train.py --frame-budget 300000 --seed 0 --sf on --bootstrap on \
+  --log-path results/ab_bs_on.csv
+python train.py --frame-budget 300000 --seed 0 --sf on --bootstrap off \
+  --log-path results/ab_bs_off.csv
+```
+
+What to watch: once V_sf grows past init (gate opens), `score_std` should be
+higher with bootstrap on — plans are ranked by value instead of tied on
+distance. Win rate is the real test.
 
 ### Run tests
 

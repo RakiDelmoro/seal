@@ -15,6 +15,7 @@ from imagination.engine import ImaginationEngine
 from training.success_tracker import SuccessTracker
 from utils.checkpoint import load_checkpoint
 import core.seal_core as _seal_core_module
+import imagination.engine as _engine_module
 
 
 def evaluate(core: SEALCore, pipe: PerceptionPipeline,
@@ -111,10 +112,16 @@ if __name__ == "__main__":
                         choices=["on", "off"],
                         help="override SF_ENABLE (successor-feature value) "
                              "for evaluation")
+    parser.add_argument("--bootstrap", type=str, default=None,
+                        choices=["on", "off"],
+                        help="override BOOTSTRAP_ENABLE (terminal-value "
+                             "scoring) for evaluation")
     args = parser.parse_args()
 
     if args.sf is not None:
         _seal_core_module.SF_ENABLE = (args.sf == "on")
+    if args.bootstrap is not None:
+        _engine_module.BOOTSTRAP_ENABLE = (args.bootstrap == "on")
     if args.checkpoint:
         core, meta = load_checkpoint(args.checkpoint)
         pipe = PerceptionPipeline()

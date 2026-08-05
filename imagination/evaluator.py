@@ -13,7 +13,7 @@ import numpy as np
 
 from config import (
     DANGER_PENALTY, IMAGINATION_ALPHA_V, IMAGINATION_ALPHA_V_MAX,
-    IMAGINATION_ALPHA_V_GROWTH,
+    IMAGINATION_ALPHA_V_GROWTH, GAMMA,
 )
 from imagination.geometric_goal import GeometricGoal
 
@@ -77,6 +77,76 @@ class ValueScorer:
         """Gradually increase reliance on the value function as it learns."""
         self.alpha = min(self.alpha_max,
                          self.alpha + self.alpha_growth * n_frames)
+
+
+class BootstrapScorer:
+    """Dreamer/MuZero/TD-MPC-style scoring: "arrive OR be valued."
+
+    The rollout does NOT need to reach the goal s*. Each trajectory is graded by
+
+        score = Σ_t γᵗ · r̂(ŝ_t)  +  γᴴ · V_term(ŝ_H)  −  danger_penalty · 𝟙[danger]
+
+    predicted reward along the way plus the LEARNED VALUE at the endpoint.
+    A 5-step rollout walks ~3 units toward a ~150-unit-away goal — arrival is
+    impossible (measured: best-of-40 got closer in 0/43 windows), so grading
+    by absolute distance ties all plans into noise. Grading by the endpoint's
+    learned value makes the effective horizon infinite: V_term(ŝ_H) carries
+    "how good is the rest of the future from here?" without walking further.
+    s* still steers rollout DIRECTION via the inverse model D; it is the
+    grade, not the compass, that changes.
+
+    Vectorized over all K trajectories: one matmul for the path rewards, one
+    for the terminal values, one batched danger check — same cost class as
+    the geometric scorer.
+    """
+
+    def __init__(self):
+        self.geo = _get_geometric()
+
+    def score_trajectories(self, trajectories: list[dict],
+                           reward_model, terminal_value,
+                           danger_penalty: float = DANGER_PENALTY
+                           ) -> tuple[list[float], int]:
+        """Score all trajectories; return (scores, best_idx).
+
+        Args:
+            trajectories: sampler output; each dict holds "states" (list of
+                predicted states, length H).
+            reward_model: r̂ — linear reward predictor (attr `w`).
+            terminal_value: the value function to bootstrap with — pass
+                core.scorer_value() (V_sf when SF is on, else V). Linear
+                readout with attr `w`.
+            danger_penalty: subtracted if any imagined state has the ball on
+                our side.
+        """
+        K = len(trajectories)
+        if K == 0:
+            return [], 0
+        S = np.stack([np.stack(t["states"]) for t in trajectories])  # (K, H, N)
+        _, H, N = S.shape
+
+        # (a) The trip: Σ_t γᵗ r̂(ŝ_t) — predicted reward along the rollout.
+        r_seq = S.reshape(K * H, N) @ reward_model.w                 # (K*H,)
+        discounts = GAMMA ** np.arange(H, dtype=np.float32)          # (H,)
+        trip = (r_seq.reshape(K, H) @ discounts)                     # (K,)
+
+        # (b) The landing: γᴴ · V_term(ŝ_H) — value at the endpoint.
+        terminal = S[:, -1, :] @ terminal_value.w                    # (K,)
+        landing = (GAMMA ** H) * terminal
+
+        # (c) The cliff: danger penalty if any imagined state is on our side.
+        E = self.geo._energies_batch(S.reshape(K * H, N))            # (K*H, 81)
+        peaks = np.argmax(E, axis=1)
+        best_e = E[np.arange(K * H), peaks]
+        pxs = peaks % self.geo.grid
+        danger = ((best_e >= self.geo.min_energy)
+                  & (pxs <= self.geo.our_side_px)).reshape(K, H).any(axis=1)
+
+        scores = trip + landing
+        scores = scores - danger_penalty * danger.astype(np.float32)
+        scores = [float(x) for x in scores]
+        best_idx = int(np.argmax(scores))
+        return scores, best_idx
 
 
 def evaluate_trajectory(traj: dict,

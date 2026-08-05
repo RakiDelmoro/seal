@@ -121,6 +121,23 @@ ETA_SF = 1e-3               # critic lr for the auxiliary (r̂) TD stream —
                             # rate as the other small-signal readouts B/D/r̂
 SF_SEED = 49
 
+# ─── Bootstrap trajectory scoring — "arrive OR be valued" ──────
+# GCML's absolute-distance score −‖ŝ_H − s*‖ requires the rollout to ARRIVE
+# at the goal. On Pong that never happens: the goal is ~150 units away and a
+# 5-step rollout walks ~3 (measured: best-of-40 got closer in 0/43 windows),
+# so all plans tie and "best" is noise. The standard fix across model-based
+# RL — Dreamer (arXiv:1912.01603: short horizons need value bootstrapping),
+# MuZero (leaf scored by the value network), TD-MPC (5-step rollout + learned
+# terminal Q), classical MPC (terminal cost) — score the short rollout by
+# predicted reward along the way plus the LEARNED VALUE at the endpoint:
+#
+#   score = Σ_t γᵗ r̂(ŝ_t) + γᴴ · V_term(ŝ_H) − danger_penalty · 𝟙[danger]
+#
+# V_term = core.scorer_value() (V_sf when SF_ENABLE, else V). The rollout no
+# longer needs to reach the ghost-goal; s* still steers rollout DIRECTION via
+# the inverse model D, but the grade comes from value. A/B: --bootstrap off.
+BOOTSTRAP_ENABLE = True
+
 # ─── Policy π (actor) — streaming actor-critic ────────────────────
 # Learns by (1) imitating imagination's chosen first action every frame and
 # (2) a per-step actor-critic update: reinforce the taken action by the TD(λ)

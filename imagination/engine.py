@@ -22,13 +22,13 @@ from __future__ import annotations
 import numpy as np
 
 from imagination.sampler import sample_trajectories
-from imagination.evaluator import ValueScorer
+from imagination.evaluator import ValueScorer, BootstrapScorer
 from imagination.geometric_goal import GeometricGoal
 
 from config import (
     N_TRAJECTORIES, IMAGINATION_HORIZON, N_ACTIONS,
     EPSILON_BASE, EPSILON_FLOOR, TOP5_SAMPLING_PROB, DANGER_PENALTY,
-    PI_CONFIDENCE_THRESHOLD, PI_FORCE_IMAGINATION,
+    PI_CONFIDENCE_THRESHOLD, PI_FORCE_IMAGINATION, BOOTSTRAP_ENABLE,
 )
 
 
@@ -47,6 +47,7 @@ class ImaginationEngine:
         self.top5_prob = top5_prob
         self.geometric = GeometricGoal()
         self.scorer = ValueScorer()
+        self.bootstrap = BootstrapScorer()
         self.rng = np.random.default_rng()
 
         self.last_scores = None
@@ -60,6 +61,20 @@ class ImaginationEngine:
         self._recent_values = []
         self._value_window = 100
         self._v_signal_threshold = 0.01
+
+        # Bootstrap scoring only kicks in once the terminal value has learned
+        # something (weight norm grown past init). Until then imagination
+        # falls back to pure geometric scoring — GCML's original design.
+        self._term_init_norm = None
+        self._term_growth_threshold = 1.05
+
+    def _terminal_ready(self, core) -> bool:
+        """True once the scoring value (V_sf or V) has grown past init."""
+        w_norm = float(np.linalg.norm(core.scorer_value().w))
+        if self._term_init_norm is None:
+            self._term_init_norm = w_norm
+            return False
+        return w_norm > self._term_init_norm * self._term_growth_threshold
 
     def _v_has_signal(self, core) -> bool:
         """True if the SCORING value distinguishes states (std over recent
@@ -126,9 +141,17 @@ class ImaginationEngine:
                 horizon=self.horizon,
                 rng=self.rng,
             )
-            scores, best_idx = self.scorer.score_trajectories(
-                trajectories, value=core.scorer_value(), s_star=s_star,
-                danger_penalty=DANGER_PENALTY)
+            if BOOTSTRAP_ENABLE and self._terminal_ready(core):
+                # "Arrive OR be valued": trip reward + terminal value bootstrap
+                # (Dreamer/MuZero/TD-MPC form). The rollout need not reach s*.
+                scores, best_idx = self.bootstrap.score_trajectories(
+                    trajectories, reward_model=core.reward_model,
+                    terminal_value=core.scorer_value(),
+                    danger_penalty=DANGER_PENALTY)
+            else:
+                scores, best_idx = self.scorer.score_trajectories(
+                    trajectories, value=core.scorer_value(), s_star=s_star,
+                    danger_penalty=DANGER_PENALTY)
             self.last_scores = scores
             self.last_best_idx = best_idx
 
